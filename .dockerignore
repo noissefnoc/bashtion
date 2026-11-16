@@ -1,0 +1,8 @@
+.git
+.github
+bin
+*.trace
+*.log
+.bashtion-cache.json
+.gomutants-cache.json
+mutation-report.json

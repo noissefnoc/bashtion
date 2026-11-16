@@ -1,0 +1,73 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+
+  - repo: local
+    hooks:
+      # --- Go Checks ---
+      - id: go-fmt
+        name: go fmt
+        entry: gofmt -w
+        language: system
+        types: [go]
+
+      - id: go-build
+        name: go build check
+        entry: go build ./...
+        language: system
+        files: \.go$
+        pass_filenames: false
+
+      - id: golangci-lint
+        name: golangci-lint
+        entry: golangci-lint run
+        language: system
+        files: \.go$
+        pass_filenames: false
+
+      - id: go-test
+        name: go unit tests (fast)
+        entry: go test ./...
+        language: system
+        files: \.go$
+        pass_filenames: false
+
+      - id: guide-skill-sync
+        name: guide.md and SKILL.md sync check
+        entry: go test ./internal/bashtion -run TestAgentGuideAndSkillAreInSync
+        language: system
+        files: ^(internal/bashtion/guide\.md|skills/bashtion/SKILL\.md)$
+        pass_filenames: false
+
+      # --- GitHub Actions Checks ---
+      - id: jactionlint
+        name: jactionlint
+        entry: jactionlint
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+
+      - id: zizmor
+        name: zizmor
+        entry: zizmor .github/workflows/
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+        pass_filenames: false
+
+      - id: actions-lock-verify
+        name: actions-lock verify (local)
+        entry: gh actions-lock --verify-local
+        language: system
+        files: ^\.github/workflows/
+        pass_filenames: false
+
+      # --- Secret Leak Checks ---
+      - id: gitleaks
+        name: gitleaks (git staged)
+        entry: gitleaks git --staged --redact
+        language: system
+        pass_filenames: false

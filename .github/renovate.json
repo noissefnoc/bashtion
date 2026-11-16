@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
+  "timezone": "Asia/Tokyo",
+  "schedule": ["before 9am on monday"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchManagers": ["mise"],
+      "groupName": "mise tools",
+      "commitMessageTopic": "mise tools"
+    },
+    {
+      "matchManagers": ["gomod"],
+      "groupName": "go dependencies",
+      "commitMessageTopic": "go dependencies"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "commitMessageTopic": "github actions"
+    },
+    {
+      "matchManagers": ["dockerfile"],
+      "groupName": "docker images",
+      "commitMessageTopic": "docker images"
+    }
+  ],
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 0
+}

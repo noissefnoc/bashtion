@@ -1,0 +1,52 @@
+name: "Bug Report"
+description: "File an issue about unexpected behavior, parse errors, or crashes."
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! Please fill out the sections below to help us reproduce and fix it.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "Bug Description"
+      description: "A clear and concise description of what the bug is."
+      placeholder: "When running bashtion on script.sh with [[ ... ]], an invalid mutant was generated..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Reproduction Steps or Minimal Script"
+      description: "Provide the minimal Bash script and Bats test, or exact command-line invocation to reproduce the issue."
+      render: bash
+      placeholder: |
+        # target.sh
+        my_func() {
+            ...
+        }
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected Behavior"
+      description: "What did you expect to happen instead?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Environment Details"
+      description: "bashtion version, OS, Bash version, and Bats version."
+      placeholder: |
+        - bashtion: v0.1.0 (or commit hash)
+        - OS: macOS 14.x / Ubuntu 24.04
+        - Bash: GNU bash, version 5.2.x
+        - bats-core: 1.11.x
+    validations:
+      required: false

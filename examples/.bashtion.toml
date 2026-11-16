@@ -1,0 +1,5 @@
+target = "examples/deploy_helper.sh"
+test = "examples/deploy_helper.bats"
+bats = "bats"
+jobs = 4
+timeout = "5s"

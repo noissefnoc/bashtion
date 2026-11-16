@@ -1,0 +1,22 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - misspell
+    - unconvert
+  exclusions:
+    rules:
+      - linters:
+          - errcheck
+        text: "Error return value of `fmt\\.Fprint"
+      - linters:
+          - errcheck
+        text: "Error return value of `os\\.RemoveAll"
+      - path: _test\.go
+        linters:
+          - errcheck

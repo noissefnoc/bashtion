@@ -1,0 +1,117 @@
+[tools]
+go = "1.27.3"
+bats = "1.14.0"
+"go:github.com/gomutants/gomutants" = "0.7.2"
+prek = "0.5.7"
+golangci-lint = "2.15.0"
+jactionlint = "2.4.0"
+zizmor = "1.32.0"
+shellcheck = "0.11.0"
+gitleaks = "8.30.1"
+syft = "1.57.1"
+gh = "2.103.3"
+"go:golang.org/x/vuln/cmd/govulncheck" = "1.1.4"
+
+[tasks.lint-go]
+description = "Lint Go source files with golangci-lint"
+run = "golangci-lint run"
+
+[tasks.lint-actions]
+description = "Lint GitHub Actions workflows with jactionlint"
+run = "jactionlint"
+
+[tasks.scan-security]
+description = "Scan GitHub Actions workflows for security vulnerabilities with zizmor"
+run = "zizmor .github/workflows/"
+
+[tasks.verify-actions-lock]
+description = "Verify GitHub Actions lockfile with gh actions-lock"
+run = [
+  "gh extension list | grep -q actions-lock || gh extension install github/gh-actions-lock --pin v0.1.4",
+  "gh actions-lock --verify-local",
+]
+
+[tasks.scan-secrets]
+description = "Scan for hardcoded secrets with gitleaks"
+run = "gitleaks detect --redact"
+
+[tasks.scan-vulns]
+description = "Scan Go source and dependencies for vulnerabilities with govulncheck"
+run = "govulncheck ./..."
+
+[tasks.lint]
+description = "Run all linters and security scanners (Go + Workflows + Lockfile + Secrets + Vulnerabilities)"
+depends = ["lint-go", "lint-actions", "scan-security", "verify-actions-lock", "scan-secrets", "scan-vulns"]
+
+[tasks.setup-hooks]
+description = "Install Git pre-commit hooks using prek and gh-actions-lock extension"
+run = [
+  "gh extension list | grep -q actions-lock || gh extension install github/gh-actions-lock --pin v0.1.4",
+  "prek install",
+]
+
+[tasks.run-hooks]
+description = "Run all Git hooks across all files using prek"
+run = "prek run --all-files"
+
+[tasks.test-go]
+description = "Run Go unit tests with race detector"
+run = "go test -v -race ./..."
+
+[tasks.test-bats]
+description = "Run Bats baseline tests"
+run = "bats examples/deploy_helper.bats examples/advanced_syntax.bats"
+
+[tasks.test]
+description = "Run Go unit tests and Bats baseline tests"
+depends = ["test-go", "test-bats"]
+
+[tasks.bench]
+description = "Run Go benchmarks for mutator and runner"
+run = "go test -run=^$ -bench=. -benchmem ./internal/mutator ./internal/runner"
+
+[tasks.demo]
+description = "Run bashtion against example Bash script"
+run = "go run ./cmd/bashtion --config examples/.bashtion.toml"
+
+[tasks.demo-llm]
+description = "Run bashtion with LLM Agent feedback format"
+run = "go run ./cmd/bashtion --config examples/.bashtion.toml --format llm"
+
+[tasks.summary]
+description = "Run bashtion in Markdown format for summary reporting"
+run = "go run ./cmd/bashtion --config examples/.bashtion.toml --no-cache --format markdown"
+
+[tasks.mutate-self]
+description = "Run gomutants self-mutation testing on pure logic packages"
+run = "gomutants -quiet ./internal/cache/... ./internal/coverage/... ./internal/gitdiff/... ./internal/report/..."
+
+[tasks.mutate-self-pr]
+description = "Run gomutants self-mutation check on changed lines in pure logic packages"
+run = "gomutants -quiet --changed-since origin/main ./internal/cache/... ./internal/coverage/... ./internal/gitdiff/... ./internal/report/..."
+
+[tasks.docker-build]
+description = "Build Linux Docker image for bashtion testing (Ubuntu 26.04 + Bash 5 + Bats)"
+run = "docker build -t bashtion:latest ."
+
+[tasks.docker-test]
+description = "Run bashtion against example test suite inside Docker container"
+run = "docker run --rm -e XDG_CACHE_HOME=/tmp/bashtion-cache -v \"$PWD\":/workspace -w /workspace bashtion:latest --config examples/.bashtion.toml"
+
+[tasks.docker-smoke]
+description = "Build Linux image and run bashtion under cgroup --cpus=2 quota inside OrbStack/Docker container"
+depends = ["docker-build"]
+run = "docker run --rm --cpus=2 -e XDG_CACHE_HOME=/tmp/bashtion-cache -v \"$PWD\":/workspace -w /workspace bashtion:latest --config examples/.bashtion.toml --no-cache"
+
+[tasks.docker-shell]
+description = "Open interactive Ubuntu Bash shell with bashtion preinstalled for external repo testing (e.g. pyenv, bats-core)"
+depends = ["docker-build"]
+run = "docker run --rm -it --entrypoint /bin/bash -e XDG_CACHE_HOME=/tmp/bashtion-cache -v \"$PWD\":/workspace -w /workspace bashtion:latest"
+
+[tasks.docker-run]
+description = "Run bashtion in Docker container against current directory (pass args via `mise run docker-run -- ...`)"
+run = "docker run --rm -v \"$PWD\":/workspace -w /workspace bashtion:latest"
+
+[tasks.docker-clean]
+description = "Remove local bashtion Docker image"
+run = "docker rmi bashtion:latest || true"

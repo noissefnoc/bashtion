@@ -1,0 +1,55 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (vendor)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Build outputs & binaries
+/bashtion
+/bin/
+/dist/
+
+# Coverage and profiling
+*.cover
+*.coverage
+cover.out
+coverage.html
+profile.out
+
+# Tool caches and test artifacts
+.gomutants-cache.json
+.bashtion-cache.json
+mutation-report.json
+*.tmp
+target.sh
+target.bats
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
