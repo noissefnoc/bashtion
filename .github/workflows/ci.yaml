@@ -13,56 +13,126 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect Changed Files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify Changed Files
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          go_changed=false
+          wf_changed=false
+
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+            changed=$(git diff --name-only "$PR_BASE_SHA" "$HEAD_SHA")
+          elif [[ -n "$PUSH_BEFORE_SHA" && "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            changed=$(git diff --name-only "$PUSH_BEFORE_SHA" "$HEAD_SHA")
+          else
+            # Initial branch push or fallback: run all checks
+            go_changed=true
+            wf_changed=true
+            changed=""
+          fi
+
+          if [[ -n "$changed" ]]; then
+            if printf '%s\n' "$changed" | grep -Eq '(\.go$|^go\.(mod|sum)$|^\.golangci\.yaml$|^mise\.toml$|^examples/|^internal/bashtion/guide\.md$|^skills/bashtion/SKILL\.md$)'; then
+              go_changed=true
+            fi
+            if printf '%s\n' "$changed" | grep -Eq '(^\.github/workflows/|^mise\.toml$)'; then
+              wf_changed=true
+            fi
+          fi
+
+          echo "go=${go_changed}" >> "$GITHUB_OUTPUT"
+          echo "workflows=${wf_changed}" >> "$GITHUB_OUTPUT"
+
   lint:
     name: Lint & Security Analysis
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.workflows == 'true'
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - uses: jdx/mise-action@v5
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.workflows == 'true'
 
       - name: Lint Go Code (golangci-lint)
+        if: needs.changes.outputs.go == 'true'
         run: mise run lint-go
 
+      - name: Scan Go Code for Vulnerabilities (govulncheck)
+        if: needs.changes.outputs.go == 'true'
+        run: mise run scan-vulns
+
       - name: Lint Workflow Files (jactionlint)
+        if: needs.changes.outputs.workflows == 'true'
         run: mise run lint-actions
 
       - name: Scan Workflows for Security (zizmor)
+        if: needs.changes.outputs.workflows == 'true'
         run: mise run scan-security
 
       - name: Verify Workflow Lockfile (gh actions-lock)
+        if: needs.changes.outputs.workflows == 'true'
         run: mise run verify-actions-lock
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Scan Go Code for Vulnerabilities (govulncheck)
-        run: mise run scan-vulns
+      - name: Skip Lint (No Relevant Changes)
+        if: needs.changes.outputs.go != 'true' && needs.changes.outputs.workflows != 'true'
+        run: echo "No relevant Go or workflow changes detected; passing check."
 
   test:
     name: Go & Bats Test Suite
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.go == 'true'
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - uses: jdx/mise-action@v5
+        if: needs.changes.outputs.go == 'true'
 
       - name: Run Go Unit Tests
+        if: needs.changes.outputs.go == 'true'
         run: mise run test-go
 
       - name: Run Bats Baseline Tests
+        if: needs.changes.outputs.go == 'true'
         run: mise run test-bats
 
       - name: Run bashtion (GitHub Actions Step Summary)
+        if: needs.changes.outputs.go == 'true'
         run: mise run summary >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run gomutants Self-Mutation Check (Changed Lines)
-        if: github.event_name == 'pull_request'
+        if: needs.changes.outputs.go == 'true' && github.event_name == 'pull_request'
         run: mise run mutate-self-pr
+
+      - name: Skip Tests (No Relevant Changes)
+        if: needs.changes.outputs.go != 'true'
+        run: echo "No relevant Go or test changes detected; passing check."
