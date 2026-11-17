@@ -57,7 +57,7 @@ func MainCommandByArgs(args []string, inout *cli.ProcInout) int {
 	}
 
 	if opts.Version {
-		fmt.Fprintf(inout.Stdout, "bashtion version %s\n", Version)
+		fmt.Fprintf(inout.Stdout, "bashtion version %s\n", effectiveToolVersion())
 		return ExitSuccess
 	}
 
@@ -85,7 +85,7 @@ func MainCommandByOptions(opts *Options, inout *cli.ProcInout) error {
 // MainCommandWithDeps executes the mutation testing command with explicit dependencies.
 func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 	if opts.Version {
-		fmt.Fprintf(inout.Stdout, "bashtion version %s\n", Version)
+		fmt.Fprintf(inout.Stdout, "bashtion version %s\n", effectiveToolVersion())
 		return nil
 	}
 	if opts.Guide {

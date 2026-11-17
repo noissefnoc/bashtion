@@ -37,6 +37,22 @@ func TestMainCommandByArgs_Version(t *testing.T) {
 	if stdout.String() != expected {
 		t.Errorf("stdout = %q, want %q", stdout.String(), expected)
 	}
+
+	// When Version is "dev", MainCommandByArgs should use effectiveToolVersion() (e.g. build info / VCS revision).
+	Version = "dev"
+	stdout.Reset()
+	code = MainCommandByArgs([]string{"-v"}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+	if code != 0 {
+		t.Fatalf("want exit code 0 for -v, got %d (stderr: %s)", code, stderr.String())
+	}
+	wantDev := "bashtion version " + effectiveToolVersion() + "\n"
+	if stdout.String() != wantDev {
+		t.Errorf("stdout for dev = %q, want %q", stdout.String(), wantDev)
+	}
 }
 
 func TestMainCommandByArgs_Guide(t *testing.T) {
