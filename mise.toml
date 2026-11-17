@@ -27,7 +27,7 @@ run = "zizmor .github/workflows/"
 [tasks.verify-actions-lock]
 description = "Verify GitHub Actions lockfile with gh actions-lock"
 run = [
-  "gh extension list | grep -q actions-lock || gh extension install github/gh-actions-lock --pin v0.1.4",
+  "gh extension list | grep -q actions-lock || gh extension install github/gh-actions-lock --pin v0.4.0",
   "gh actions-lock --verify-local",
 ]
 
@@ -46,7 +46,7 @@ depends = ["lint-go", "lint-actions", "scan-security", "verify-actions-lock", "s
 [tasks.setup-hooks]
 description = "Install Git pre-commit hooks using prek and gh-actions-lock extension"
 run = [
-  "gh extension list | grep -q actions-lock || gh extension install github/gh-actions-lock --pin v0.1.4",
+  "gh extension list | grep -q actions-lock || gh extension install github/gh-actions-lock --pin v0.4.0",
   "prek install",
 ]
 
