@@ -3,7 +3,6 @@
   "extends": [
     "config:recommended",
     ":semanticCommits",
-    "helpers:pinGitHubActionDigests",
     "docker:pinDigests"
   ],
   "timezone": "Asia/Tokyo",
