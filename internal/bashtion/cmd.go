@@ -3,9 +3,11 @@
 package bashtion
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -93,7 +95,7 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 		return nil
 	}
 
-	pairs, err := discovery.ResolvePairs(deps.WorkDir, opts.TargetPatterns(), opts.Test, opts.Mappings, opts.List)
+	pairs, err := discovery.ResolvePairs(deps.WorkDir, opts.TargetPatterns(), opts.TestPatterns(), opts.Mappings, opts.List)
 	if err != nil {
 		return err
 	}
@@ -162,8 +164,8 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 		if opts.List {
 			fmt.Fprintf(inout.Stdout, "Target: %s (generated %d AST mutants)\n", pair.TargetFile, len(mutants))
 			for _, m := range mutants {
-				fmt.Fprintf(inout.Stdout, "  #%02d [%s] %s:%d:%d  %s (%q -> %q)\n",
-					m.ID, m.Category, m.FilePath, m.Line, m.Col, m.Description, m.Original, m.Replacement)
+				fmt.Fprintf(inout.Stdout, "  #%02d [%s] key=%s %s:%d:%d  %s (%q -> %q)\n",
+					m.ID, m.Category, m.Key(), m.FilePath, m.Line, m.Col, m.Description, m.Original, m.Replacement)
 			}
 			continue
 		}
@@ -185,10 +187,11 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 	if !opts.NoCache {
 		cachePath = resolveCacheFilePath(deps.WorkDir, opts.CacheFile, deps.Executor == nil)
 		if cachePath != "" {
-			// Best-effort cache load: cache.Load returns a fresh empty Store even if the file is
-			// missing, corrupt, or unreadable. Cache read errors are intentionally ignored so that
-			// mutation testing proceeds cleanly without failing the run.
-			cacheStore, _ = cache.Load(cachePath)
+			var loadErr error
+			cacheStore, loadErr = cache.Load(cachePath)
+			if loadErr != nil {
+				fmt.Fprintf(inout.Stderr, "warning: failed to read cache file %q (%v); pass --cache-file <writable-path>, set XDG_CACHE_HOME, or pass --no-cache to disable caching\n", cachePath, loadErr)
+			}
 		}
 	}
 
@@ -197,15 +200,25 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 	var testLabels []string
 	seenTests := make(map[string]bool)
 	seenWarnings := make(map[string]bool)
-	combined := &runner.Summary{}
+	combined := &runner.Summary{
+		CacheEnabled: !opts.NoCache,
+		CacheFile:    cachePath,
+	}
+
+	wsExcludes := append([]string(nil), opts.WorkspaceExclude...)
+	if opts.JSONOut != "" {
+		if relOut := relativeInsideWorkDir(deps.WorkDir, opts.JSONOut); relOut != "" {
+			wsExcludes = append(wsExcludes, relOut)
+		}
+	}
 
 	totalAllMutants := 0
 	targetFiles := make([]string, 0, len(prepared))
-	testFiles := make([]string, 0, len(prepared))
+	var testFiles []string
 	for _, pt := range prepared {
 		totalAllMutants += len(pt.mutants)
 		targetFiles = append(targetFiles, pt.pair.TargetFile)
-		testFiles = append(testFiles, pt.pair.TestFile)
+		testFiles = append(testFiles, pt.pair.TestFiles...)
 	}
 	overallCompleted := 0
 
@@ -218,7 +231,7 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 			TargetFiles:       targetFiles,
 			TestFiles:         testFiles,
 			WorkspaceIncludes: opts.WorkspaceInclude,
-			WorkspaceExcludes: opts.WorkspaceExclude,
+			WorkspaceExcludes: wsExcludes,
 		})
 		if wsErr != nil {
 			return fmt.Errorf("failed to initialize shared workspace: %w", wsErr)
@@ -229,24 +242,36 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 	}
 
 	useColor := cli.SupportsColor(inout.Stderr)
+	emitProgress := shouldEmitProgress(format, opts.Progress, opts.Quiet, inout.Stderr)
 
-	for _, pt := range prepared {
+	for pairIdx, pt := range prepared {
 		targetLabels = append(targetLabels, pt.pair.TargetFile)
-		if !seenTests[pt.pair.TestFile] {
-			seenTests[pt.pair.TestFile] = true
-			testLabels = append(testLabels, pt.pair.TestFile)
+		for _, tf := range pt.pair.TestFiles {
+			if !seenTests[tf] {
+				seenTests[tf] = true
+				testLabels = append(testLabels, tf)
+			}
 		}
 
 		var onProgress func(completed, total int, res runner.Result)
-		if format == report.FormatText {
+		if emitProgress {
 			fmt.Fprintf(inout.Stderr, "Target: %s (generated %d AST mutants)\n", pt.pair.TargetFile, len(pt.mutants))
-			fmt.Fprintf(inout.Stderr, "Test:   %s (jobs: %d)\n\n", pt.pair.TestFile, opts.Jobs)
+			fmt.Fprintf(inout.Stderr, "Test:   %s (jobs: %d)\n", strings.Join(pt.pair.TestFiles, ", "), opts.Jobs)
+			if pairIdx == 0 {
+				if opts.NoCache {
+					fmt.Fprintf(inout.Stderr, "Cache:  disabled (--no-cache)\n")
+				} else if cachePath != "" {
+					fmt.Fprintf(inout.Stderr, "Cache:  %s\n", cachePath)
+				}
+			}
+			fmt.Fprintln(inout.Stderr)
 			onProgress = func(completed, total int, res runner.Result) {
 				m := res.Mutant
 				statusLabel := string(res.Status)
-				if res.Uncovered {
+				if res.Status == runner.StatusUncovered || res.Uncovered {
 					statusLabel = "UNCOVERED"
-				} else if res.Cached {
+				}
+				if res.Cached {
 					statusLabel += "*"
 				}
 				displayStatus := formatProgressStatus(statusLabel, res, useColor)
@@ -272,10 +297,11 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 			WorkDir:           deps.WorkDir,
 			WorkspaceDir:      opts.Workspace,
 			WorkspaceIncludes: opts.WorkspaceInclude,
-			WorkspaceExcludes: opts.WorkspaceExclude,
+			WorkspaceExcludes: wsExcludes,
 			Workspace:         wsSession,
 			TargetFile:        pt.pair.TargetFile,
-			TestFile:          pt.pair.TestFile,
+			TestFile:          strings.Join(pt.pair.TestFiles, ", "),
+			TestFiles:         pt.pair.TestFiles,
 			BatsBin:           opts.BatsBin,
 			BatsArgs:          opts.BatsArgs,
 			Jobs:              opts.Jobs,
@@ -305,6 +331,9 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 		if sub.Jobs > combined.Jobs {
 			combined.Jobs = sub.Jobs
 		}
+		if sub.CoverageEnabled {
+			combined.CoverageEnabled = true
+		}
 		combined.Total += sub.Total
 		combined.Killed += sub.Killed
 		combined.Survived += sub.Survived
@@ -317,10 +346,12 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 		overallCompleted += len(pt.mutants)
 	}
 
-	// Best-effort cache save: failures to persist cache (e.g. read-only filesystem or disk full)
-	// are intentionally ignored so that they do not fail the overall mutation run or affect exit codes.
+	// Best-effort cache save: failures to persist cache (e.g. read-only filesystem or sandbox)
+	// emit an actionable warning on stderr without failing the mutation run or affecting exit codes.
 	if !opts.NoCache && cacheStore != nil && cachePath != "" {
-		_ = cacheStore.Save(cachePath)
+		if saveErr := cacheStore.Save(cachePath); saveErr != nil {
+			fmt.Fprintf(inout.Stderr, "warning: failed to write cache file %q (%v); pass --cache-file <writable-path>, set XDG_CACHE_HOME, or pass --no-cache to disable caching\n", cachePath, saveErr)
+		}
 	}
 
 	if combined.Jobs == 0 {
@@ -328,11 +359,26 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 	}
 	combined.TargetFile = strings.Join(targetLabels, ", ")
 	combined.TestFile = strings.Join(testLabels, ", ")
+	combined.TestFiles = testLabels
 	combined.AllowZeroMutants = opts.GitDiff != ""
 	combined.TotalDuration = time.Since(overallStart)
 
 	if err := report.WriteMulti(inout.Stdout, format, combined, origSrcByFile, defaultOrigSrc, opts.MinScore); err != nil {
 		return fmt.Errorf("writing report: %w", err)
+	}
+
+	if opts.JSONOut != "" {
+		jsonOutPath := opts.JSONOut
+		if !filepath.IsAbs(jsonOutPath) && deps.WorkDir != "" {
+			jsonOutPath = filepath.Join(deps.WorkDir, jsonOutPath)
+		}
+		var jsonBuf bytes.Buffer
+		if err := report.WriteMulti(&jsonBuf, report.FormatJSON, combined, origSrcByFile, defaultOrigSrc, opts.MinScore); err != nil {
+			return fmt.Errorf("rendering --json-out report: %w", err)
+		}
+		if err := writeFileAtomic(jsonOutPath, jsonBuf.Bytes(), 0o644); err != nil {
+			return fmt.Errorf("writing --json-out %q: %w", opts.JSONOut, err)
+		}
 	}
 
 	if opts.MinScore > 0 {
@@ -394,14 +440,79 @@ func resolveCacheFilePath(workDir, explicitPath string, isRealRun bool) string {
 	return cache.DefaultFileName
 }
 
+func shouldEmitProgress(format report.Format, mode ProgressMode, quiet bool, stderr io.Writer) bool {
+	if quiet || mode == ProgressNever {
+		return false
+	}
+	if mode == ProgressAlways {
+		return true
+	}
+	// ProgressAuto (default): emit progress for text/json/markdown; keep llm compact unless stderr is interactive.
+	if format == report.FormatLLM {
+		return cli.IsInteractive(stderr)
+	}
+	return true
+}
+
+func relativeInsideWorkDir(workDir, p string) string {
+	base := workDir
+	if base == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return ""
+		}
+		base = wd
+	}
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return ""
+	}
+	absP := p
+	if !filepath.IsAbs(absP) {
+		absP = filepath.Join(absBase, absP)
+	}
+	rel, err := filepath.Rel(absBase, absP)
+	if err != nil || rel == "." || !filepath.IsLocal(rel) {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(rel))
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".bashtion-out-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
 func formatProgressStatus(label string, res runner.Result, useColor bool) string {
-	padded := fmt.Sprintf("%-8s", label)
+	padded := fmt.Sprintf("%-10s", label)
 	if !useColor {
 		return padded
 	}
 	var color string
 	switch {
-	case res.Uncovered, res.Status == runner.StatusSurvived, res.Status == runner.StatusError:
+	case res.Status == runner.StatusUncovered, res.Uncovered, res.Status == runner.StatusSurvived, res.Status == runner.StatusError:
 		color = "\x1b[31m"
 	case res.Status == runner.StatusKilled:
 		color = "\x1b[32m"

@@ -51,7 +51,7 @@ func ResolveXDGCacheFile(projectDir string) string {
 }
 
 const (
-	schemaVersion   = "2"
+	schemaVersion   = "3"
 	maxCacheEntries = 10000
 )
 

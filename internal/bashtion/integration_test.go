@@ -380,3 +380,126 @@ comma_fn() {
 		t.Errorf("expected full cache hit on second run, got CacheHits=%d Total=%d", second.CacheHits, second.TotalMutants)
 	}
 }
+
+func TestIntegration_MultiTestFilesForSingleTargetAndStructuredUncovered(t *testing.T) {
+	batsPath := requireBats(t)
+	workDir := t.TempDir()
+
+	script := `#!/usr/bin/env bash
+check_low() {
+  if [[ "$1" -ge 10 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+check_high() {
+  if [[ "$1" -le 100 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+dead_path() {
+  if [[ "$1" == "never" ]]; then
+    return 0
+  fi
+  return 1
+}
+`
+	batsA := `setup() {
+  source ./range.sh
+}
+
+@test "check_low boundary" {
+  run check_low 10
+  [ "$status" -eq 0 ]
+  run check_low 9
+  [ "$status" -eq 1 ]
+}
+`
+	batsB := `setup() {
+  source ./range.sh
+}
+
+@test "check_high boundary" {
+  run check_high 100
+  [ "$status" -eq 0 ]
+  run check_high 101
+  [ "$status" -eq 1 ]
+}
+`
+	for name, body := range map[string]string{
+		"range.sh":  script,
+		"low.bats":  batsA,
+		"high.bats": batsB,
+	} {
+		if err := os.WriteFile(filepath.Join(workDir, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	jsonOut := filepath.Join(workDir, "out.json")
+	err := MainCommandWithDeps(&Options{
+		Target:  "range.sh",
+		Test:    "low.bats",
+		Tests:   []string{"high.bats"},
+		BatsBin: batsPath,
+		Jobs:    2,
+		NoCache: true,
+		Format:  "text",
+		JSONOut: jsonOut,
+	}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: stdout,
+		Stderr: stderr,
+	}, Deps{WorkDir: workDir})
+	if err != nil {
+		t.Fatalf("multi-test integration run failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	rawJSON, err := os.ReadFile(jsonOut)
+	if err != nil {
+		t.Fatalf("failed to read --json-out file: %v", err)
+	}
+	var rep struct {
+		CoverageEnabled      bool     `json:"coverage_enabled"`
+		TotalMutants         int      `json:"total_mutants"`
+		CoveredMutants       int      `json:"covered_mutants"`
+		Killed               int      `json:"killed"`
+		Survived             int      `json:"survived"`
+		Uncovered            int      `json:"uncovered"`
+		CoveredMutationScore *float64 `json:"covered_mutation_score"`
+		TestFiles            []string `json:"test_files"`
+		UncoveredMutants     []struct {
+			Key     string `json:"key"`
+			Status  string `json:"status"`
+			Covered *bool  `json:"covered"`
+		} `json:"uncovered_mutants"`
+	}
+	if err := json.Unmarshal(rawJSON, &rep); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, string(rawJSON))
+	}
+	if !rep.CoverageEnabled {
+		t.Errorf("expected coverage_enabled=true")
+	}
+	if len(rep.TestFiles) != 2 {
+		t.Errorf("expected 2 test_files, got %+v", rep.TestFiles)
+	}
+	if rep.Survived != 0 {
+		t.Errorf("expected 0 covered survived mutants when both low.bats and high.bats run together, got %d", rep.Survived)
+	}
+	if rep.Uncovered == 0 || len(rep.UncoveredMutants) != rep.Uncovered {
+		t.Errorf("expected dead_path mutants in uncovered_mutants, got uncovered=%d len=%d", rep.Uncovered, len(rep.UncoveredMutants))
+	}
+	if rep.CoveredMutationScore == nil || *rep.CoveredMutationScore != 100.0 {
+		t.Errorf("expected covered_mutation_score=100.0, got %v", rep.CoveredMutationScore)
+	}
+	for _, u := range rep.UncoveredMutants {
+		if u.Status != "UNCOVERED" || u.Covered == nil || *u.Covered || len(u.Key) != 16 {
+			t.Errorf("unexpected uncovered mutant entry: %+v", u)
+		}
+	}
+}

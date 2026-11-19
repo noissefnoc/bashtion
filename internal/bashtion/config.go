@@ -17,24 +17,28 @@ import (
 
 // FileConfig represents configuration loaded from .bashtion.toml.
 type FileConfig struct {
-	Target             string             `toml:"target"`
-	Targets            []string           `toml:"targets"`
-	Test               string             `toml:"test"`
-	Mappings           map[string]string  `toml:"mappings"`
-	BatsBin            string             `toml:"bats"`
-	BatsArgs           []string           `toml:"bats_args"`
-	Jobs               int                `toml:"jobs"`
-	Timeout            time.Duration      `toml:"timeout"`
-	Format             report.Format      `toml:"format"`
-	MinScore           float64            `toml:"min_score"`
-	GitDiff            string             `toml:"git_diff"`
-	NoCache            bool               `toml:"no_cache"`
-	NoCoverage         bool               `toml:"no_coverage"`
-	CacheFile          string             `toml:"cache_file"`
-	Workspace          string             `toml:"workspace"`
-	WorkspaceInclude   []string           `toml:"workspace_include"`
-	WorkspaceExclude   []string           `toml:"workspace_exclude"`
-	DisabledCategories []mutator.Category `toml:"disabled_categories"`
+	Target             string              `toml:"target"`
+	Targets            []string            `toml:"targets"`
+	Test               string              `toml:"test"`
+	Tests              []string            `toml:"tests"`
+	Mappings           map[string][]string `toml:"mappings"`
+	BatsBin            string              `toml:"bats"`
+	BatsArgs           []string            `toml:"bats_args"`
+	Jobs               int                 `toml:"jobs"`
+	Timeout            time.Duration       `toml:"timeout"`
+	Format             report.Format       `toml:"format"`
+	JSONOut            string              `toml:"json_out"`
+	Progress           ProgressMode        `toml:"progress"`
+	Quiet              bool                `toml:"quiet"`
+	MinScore           float64             `toml:"min_score"`
+	GitDiff            string              `toml:"git_diff"`
+	NoCache            bool                `toml:"no_cache"`
+	NoCoverage         bool                `toml:"no_coverage"`
+	CacheFile          string              `toml:"cache_file"`
+	Workspace          string              `toml:"workspace"`
+	WorkspaceInclude   []string            `toml:"workspace_include"`
+	WorkspaceExclude   []string            `toml:"workspace_exclude"`
+	DisabledCategories []mutator.Category  `toml:"disabled_categories"`
 }
 
 // LoadFileConfig reads a TOML configuration file (.bashtion.toml).
@@ -47,24 +51,28 @@ func LoadFileConfig(path string) (*FileConfig, error) {
 }
 
 type tomlRawConfig struct {
-	Target             string            `toml:"target"`
-	Targets            []string          `toml:"targets"`
-	Test               string            `toml:"test"`
-	Mappings           map[string]string `toml:"mappings"`
-	BatsBin            string            `toml:"bats"`
-	BatsArgs           any               `toml:"bats_args"`
-	Jobs               *int              `toml:"jobs"`
-	Timeout            string            `toml:"timeout"`
-	Format             string            `toml:"format"`
-	MinScore           *float64          `toml:"min_score"`
-	GitDiff            string            `toml:"git_diff"`
-	NoCache            bool              `toml:"no_cache"`
-	NoCoverage         bool              `toml:"no_coverage"`
-	CacheFile          string            `toml:"cache_file"`
-	Workspace          string            `toml:"workspace"`
-	WorkspaceInclude   []string          `toml:"workspace_include"`
-	WorkspaceExclude   []string          `toml:"workspace_exclude"`
-	DisabledCategories []string          `toml:"disabled_categories"`
+	Target             string         `toml:"target"`
+	Targets            []string       `toml:"targets"`
+	Test               any            `toml:"test"`
+	Tests              []string       `toml:"tests"`
+	Mappings           map[string]any `toml:"mappings"`
+	BatsBin            string         `toml:"bats"`
+	BatsArgs           any            `toml:"bats_args"`
+	Jobs               *int           `toml:"jobs"`
+	Timeout            string         `toml:"timeout"`
+	Format             string         `toml:"format"`
+	JSONOut            string         `toml:"json_out"`
+	Progress           string         `toml:"progress"`
+	Quiet              bool           `toml:"quiet"`
+	MinScore           *float64       `toml:"min_score"`
+	GitDiff            string         `toml:"git_diff"`
+	NoCache            bool           `toml:"no_cache"`
+	NoCoverage         bool           `toml:"no_coverage"`
+	CacheFile          string         `toml:"cache_file"`
+	Workspace          string         `toml:"workspace"`
+	WorkspaceInclude   []string       `toml:"workspace_include"`
+	WorkspaceExclude   []string       `toml:"workspace_exclude"`
+	DisabledCategories []string       `toml:"disabled_categories"`
 }
 
 // ParseFileConfig parses TOML content into FileConfig.
@@ -79,9 +87,10 @@ func ParseFileConfig(content string) (*FileConfig, error) {
 	cfg := &FileConfig{
 		Target:           raw.Target,
 		Targets:          raw.Targets,
-		Test:             raw.Test,
-		Mappings:         raw.Mappings,
+		Tests:            append([]string(nil), raw.Tests...),
 		BatsBin:          raw.BatsBin,
+		JSONOut:          raw.JSONOut,
+		Quiet:            raw.Quiet,
 		GitDiff:          raw.GitDiff,
 		NoCache:          raw.NoCache,
 		NoCoverage:       raw.NoCoverage,
@@ -89,6 +98,37 @@ func ParseFileConfig(content string) (*FileConfig, error) {
 		Workspace:        raw.Workspace,
 		WorkspaceInclude: raw.WorkspaceInclude,
 		WorkspaceExclude: raw.WorkspaceExclude,
+	}
+
+	if raw.Test != nil {
+		vals, err := parseStringOrSlice("test", raw.Test)
+		if err != nil {
+			return nil, err
+		}
+		if len(vals) == 1 && len(cfg.Tests) == 0 {
+			cfg.Test = vals[0]
+		} else if len(vals) > 0 {
+			cfg.Tests = append(vals, cfg.Tests...)
+		}
+	}
+
+	if len(raw.Mappings) > 0 {
+		cfg.Mappings = make(map[string][]string, len(raw.Mappings))
+		for k, rawVal := range raw.Mappings {
+			vals, err := parseStringOrSlice(fmt.Sprintf("mappings[%q]", k), rawVal)
+			if err != nil {
+				return nil, err
+			}
+			cfg.Mappings[k] = vals
+		}
+	}
+
+	if raw.Progress != "" {
+		p, err := ParseProgressMode(raw.Progress)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Progress = p
 	}
 
 	if raw.Jobs != nil {
@@ -156,4 +196,36 @@ func ParseFileConfig(content string) (*FileConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseStringOrSlice(field string, v any) ([]string, error) {
+	switch val := v.(type) {
+	case string:
+		if strings.TrimSpace(val) == "" {
+			return nil, nil
+		}
+		return []string{val}, nil
+	case []any:
+		out := make([]string, 0, len(val))
+		for _, item := range val {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("invalid element in %s: %v (expected string)", field, item)
+			}
+			if strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+		}
+		return out, nil
+	case []string:
+		out := make([]string, 0, len(val))
+		for _, s := range val {
+			if strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("%s must be string or list of strings", field)
+	}
 }

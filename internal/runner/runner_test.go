@@ -1869,3 +1869,130 @@ func TestRun_BatsArgsFilterChmod000ExcludedTargetsAndEnvCache(t *testing.T) {
 		t.Errorf("expected 0 cache hits after HOME/CI change, got %d", sum2.CacheHits)
 	}
 }
+
+func TestRun_MultiTestFilesAndUncoveredStatusSeparation(t *testing.T) {
+	workDir := t.TempDir()
+	script := `#!/usr/bin/env bash
+covered_fn() {
+    if [[ "$1" -eq 0 ]]; then
+        return 0
+    fi
+    return 1
+}
+uncovered_fn() {
+    if [[ "$1" -eq 1 ]]; then
+        return 0
+    fi
+    return 1
+}
+`
+	if err := os.WriteFile(filepath.Join(workDir, "app.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "a.bats"), []byte("@test \"t1\" { covered_fn 0; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "b.bats"), []byte("@test \"t2\" { covered_fn 1; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mutants, err := mutator.Generate("app.sh", []byte(script))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	var sawBothTests atomic.Bool
+	cacheFile := filepath.Join(workDir, "custom-cache.json")
+
+	executor := func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		n := calls.Add(1)
+		if len(args) >= 2 && args[len(args)-2] == "a.bats" && args[len(args)-1] == "b.bats" {
+			sawBothTests.Store(true)
+		}
+		if n == 1 {
+			// Emit baseline trace covering lines 3-6 of app.sh (covered_fn only)
+			instrumented, readErr := os.ReadFile(filepath.Join(dir, "app.sh"))
+			if readErr == nil {
+				if idx := strings.Index(string(instrumented), "__bashtion_cov_file='"); idx >= 0 {
+					rest := string(instrumented)[idx+len("__bashtion_cov_file='"):]
+					if end := strings.IndexByte(rest, '\''); end >= 0 {
+						tracePath := rest[:end]
+						var trace strings.Builder
+						for _, ln := range []int{4, 5, 6, 7} {
+							trace.WriteString("+__BASHTION_COV__:t1__BASHTION_SEP__app.sh__BASHTION_SEP__")
+							trace.WriteString(strconv.Itoa(ln))
+							trace.WriteString("__BASHTION_END__ cmd\n")
+						}
+						_ = os.WriteFile(tracePath, []byte(trace.String()), 0o644)
+					}
+				}
+			}
+			return []byte("ok 1\nok 2\n"), nil
+		}
+		// Kill half, survive half among covered mutants
+		if n%2 == 0 {
+			return []byte("not ok 1\n"), fakeKilledErr()
+		}
+		return []byte("ok 1\nok 2\n"), nil
+	}
+
+	sum, err := runner.Run(context.Background(), runner.Config{
+		WorkDir:    workDir,
+		TargetFile: "app.sh",
+		TestFiles:  []string{"a.bats", "b.bats"},
+		Jobs:       1,
+		CacheFile:  cacheFile,
+		Executor:   executor,
+	}, mutants)
+	if err != nil {
+		t.Fatalf("Run with multiple TestFiles failed: %v", err)
+	}
+	if !sawBothTests.Load() {
+		t.Errorf("expected bats executor to receive both a.bats and b.bats")
+	}
+	if !sum.CoverageEnabled {
+		t.Errorf("expected CoverageEnabled=true")
+	}
+	if sum.Uncovered == 0 || sum.Killed == 0 {
+		t.Errorf("expected both uncovered and killed mutants, got %+v", sum)
+	}
+	if sum.Killed+sum.Survived+sum.Uncovered+sum.Timeout+sum.Errors != sum.Total {
+		t.Errorf("disjoint status counts must equal Total: %+v", sum)
+	}
+	covScore, ok := sum.CoveredScore()
+	if !ok || covScore <= sum.Score() {
+		t.Errorf("expected CoveredScore (%.1f, ok=%v) > overall Score (%.1f)", covScore, ok, sum.Score())
+	}
+	for _, r := range sum.Results {
+		if r.Covered == nil {
+			t.Fatalf("expected non-nil Covered when coverage is active, got nil for %+v", r)
+		}
+		if r.Status == runner.StatusUncovered && *r.Covered {
+			t.Errorf("UNCOVERED mutant must have Covered=false: %+v", r)
+		}
+		if r.Status != runner.StatusUncovered && !*r.Covered {
+			t.Errorf("non-UNCOVERED mutant must have Covered=true: %+v", r)
+		}
+	}
+
+	// Second run should hit cache for all mutants; modifying b.bats must invalidate cache.
+	if err := os.WriteFile(filepath.Join(workDir, "b.bats"), []byte("@test \"t2\" { covered_fn 2; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	calls.Store(0)
+	sum2, err := runner.Run(context.Background(), runner.Config{
+		WorkDir:    workDir,
+		TargetFile: "app.sh",
+		TestFiles:  []string{"a.bats", "b.bats"},
+		Jobs:       1,
+		CacheFile:  cacheFile,
+		Executor:   executor,
+	}, mutants)
+	if err != nil {
+		t.Fatalf("second Run failed: %v", err)
+	}
+	if sum2.CacheHits != 0 {
+		t.Errorf("expected 0 cache hits after modifying second test file b.bats, got %d", sum2.CacheHits)
+	}
+}

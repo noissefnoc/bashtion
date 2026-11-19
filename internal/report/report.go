@@ -70,8 +70,28 @@ func WriteMulti(w io.Writer, format Format, summary *runner.Summary, origSrcByFi
 	}
 }
 
+func isUncoveredResult(res runner.Result) bool {
+	return res.Status == runner.StatusUncovered || res.Uncovered
+}
+
+func coveredPtrForResult(summary *runner.Summary, res runner.Result) *bool {
+	if res.Covered != nil {
+		v := *res.Covered
+		return &v
+	}
+	if isUncoveredResult(res) {
+		v := false
+		return &v
+	}
+	if summary != nil && summary.CoverageEnabled {
+		v := true
+		return &v
+	}
+	return nil
+}
+
 func hintForResult(res runner.Result) string {
-	if res.Uncovered {
+	if isUncoveredResult(res) {
 		return res.Mutant.UncoveredHint()
 	}
 	return res.Mutant.Hint()
@@ -91,16 +111,21 @@ func writeText(w io.Writer, summary *runner.Summary, resolveSrc func(string) []b
 	if summary.Errors > 0 {
 		fmt.Fprintf(w, "Errors        : %d\n", summary.Errors)
 	}
-	if summary.Uncovered > 0 {
-		fmt.Fprintf(w, "Survived      : %d (%d uncovered)\n", summary.Survived, summary.Uncovered)
-	} else {
-		fmt.Fprintf(w, "Survived      : %d\n", summary.Survived)
+	fmt.Fprintf(w, "Survived      : %d\n", summary.Survived)
+	if summary.Uncovered > 0 || summary.CoverageEnabled {
+		fmt.Fprintf(w, "Uncovered     : %d\n", summary.Uncovered)
 	}
 	if summary.CacheHits > 0 {
 		fmt.Fprintf(w, "Cache Hits    : %d\n", summary.CacheHits)
 	}
 	if summary.Total == 0 {
 		fmt.Fprintln(w, "Mutation Score: N/A (0 mutants generated)")
+	} else if summary.Uncovered > 0 {
+		if covScore, ok := summary.CoveredScore(); ok {
+			fmt.Fprintf(w, "Mutation Score: %.1f%% (covered only: %.1f%%)\n", summary.Score(), covScore)
+		} else {
+			fmt.Fprintf(w, "Mutation Score: %.1f%% (covered only: N/A)\n", summary.Score())
+		}
 	} else {
 		fmt.Fprintf(w, "Mutation Score: %.1f%%\n", summary.Score())
 	}
@@ -110,16 +135,27 @@ func writeText(w io.Writer, summary *runner.Summary, resolveSrc func(string) []b
 		fmt.Fprintf(w, "Survived Mutants (%d)\n", summary.Survived)
 		fmt.Fprintln(w, "----------------------------------------")
 		for _, res := range summary.Results {
-			if res.Status != runner.StatusSurvived {
+			if res.Status != runner.StatusSurvived || isUncoveredResult(res) {
 				continue
 			}
 			m := res.Mutant
-			uncovLabel := ""
-			if res.Uncovered {
-				uncovLabel = " [UNCOVERED]"
+			fmt.Fprintf(w, "\nMutant #%02d [%s] %s:%d:%d — %s\n",
+				m.ID, m.Category, m.FilePath, m.Line, m.Col, m.Description)
+			fmt.Fprint(w, m.UnifiedDiff(resolveSrc(m.FilePath)))
+		}
+	}
+
+	if summary.Uncovered > 0 {
+		fmt.Fprintln(w, "\n----------------------------------------")
+		fmt.Fprintf(w, "Uncovered Mutants (%d)\n", summary.Uncovered)
+		fmt.Fprintln(w, "----------------------------------------")
+		for _, res := range summary.Results {
+			if !isUncoveredResult(res) {
+				continue
 			}
-			fmt.Fprintf(w, "\nMutant #%02d [%s]%s %s:%d:%d — %s\n",
-				m.ID, m.Category, uncovLabel, m.FilePath, m.Line, m.Col, m.Description)
+			m := res.Mutant
+			fmt.Fprintf(w, "\nMutant #%02d [%s] [UNCOVERED] %s:%d:%d — %s\n",
+				m.ID, m.Category, m.FilePath, m.Line, m.Col, m.Description)
 			fmt.Fprint(w, m.UnifiedDiff(resolveSrc(m.FilePath)))
 		}
 	}
@@ -140,7 +176,7 @@ func writeLLM(w io.Writer, summary *runner.Summary, resolveSrc func(string) []by
 		}
 	} else if minScore > 0 && score < minScore {
 		status = "FAIL (below min-score threshold)"
-	} else if summary.Survived > 0 {
+	} else if summary.Survived > 0 || summary.Uncovered > 0 {
 		status = "NEEDS_TESTS"
 	}
 
@@ -150,6 +186,13 @@ func writeLLM(w io.Writer, summary *runner.Summary, resolveSrc func(string) []by
 	fmt.Fprintf(w, "- Bats Test Suite: `%s`\n", summary.TestFile)
 	if summary.Total == 0 {
 		fmt.Fprintln(w, "- Mutation Score: N/A (0 mutants generated)")
+	} else if summary.Uncovered > 0 {
+		covStr := "N/A"
+		if covScore, ok := summary.CoveredScore(); ok {
+			covStr = fmt.Sprintf("%.1f%%", covScore)
+		}
+		fmt.Fprintf(w, "- Mutation Score: %.1f%% (%d killed, %d timeout, %d survived, %d uncovered / %d total; covered score: %s)\n",
+			score, summary.Killed, summary.Timeout, summary.Survived, summary.Uncovered, summary.Total, covStr)
 	} else {
 		fmt.Fprintf(w, "- Mutation Score: %.1f%% (%d killed, %d timeout, %d survived / %d total)\n",
 			score, summary.Killed, summary.Timeout, summary.Survived, summary.Total)
@@ -166,30 +209,19 @@ func writeLLM(w io.Writer, summary *runner.Summary, resolveSrc func(string) []by
 		return nil
 	}
 
-	if summary.Survived == 0 {
+	if summary.Survived == 0 && summary.Uncovered == 0 {
 		fmt.Fprintln(w, "\nAll mutants were killed. No additional bats tests are required.")
 		return nil
 	}
 
-	fmt.Fprintf(w, "\n## Action Required: %d Survived Mutant(s)\n", summary.Survived)
-	fmt.Fprintf(w, "Update `%s` (without breaking `%s`) so that the following mutations cause the test suite to fail:\n",
-		summary.TestFile, summary.TargetFile)
-
-	for _, res := range summary.Results {
-		if res.Status != runner.StatusSurvived {
-			continue
-		}
+	writeLLMMutant := func(res runner.Result, stLabel string) {
 		m := res.Mutant
 		fnLabel := m.FuncName
 		if fnLabel == "" {
 			fnLabel = "<top-level>"
 		}
-		uncovTag := ""
-		if res.Uncovered {
-			uncovTag = ", status: `UNCOVERED`"
-		}
-		fmt.Fprintf(w, "\n### Mutant #%02d: `%s:%d:%d` (func: `%s`, category: `%s`%s)\n",
-			m.ID, m.FilePath, m.Line, m.Col, fnLabel, m.Category, uncovTag)
+		fmt.Fprintf(w, "\n### Mutant #%02d: `%s:%d:%d` (key: `%s`, func: `%s`, category: `%s`, status: `%s`)\n",
+			m.ID, m.FilePath, m.Line, m.Col, m.Key(), fnLabel, m.Category, stLabel)
 		fmt.Fprintf(w, "- Mutation: %s (%s -> %s)\n", m.Description, markdownInlineCode(m.Original), markdownInlineCode(m.Replacement))
 		fmt.Fprintf(w, "- Hint: %s\n", hintForResult(res))
 		diffText := m.UnifiedDiff(resolveSrc(m.FilePath))
@@ -199,10 +231,42 @@ func writeLLM(w io.Writer, summary *runner.Summary, resolveSrc func(string) []by
 		fmt.Fprintln(w, closeFence)
 	}
 
+	if summary.Survived > 0 {
+		fmt.Fprintf(w, "\n## Action Required: %d Survived Mutant(s)\n", summary.Survived)
+		fmt.Fprintf(w, "Update `%s` (without breaking `%s`) so that the following mutations cause the test suite to fail:\n",
+			summary.TestFile, summary.TargetFile)
+		for _, res := range summary.Results {
+			if res.Status != runner.StatusSurvived || isUncoveredResult(res) {
+				continue
+			}
+			writeLLMMutant(res, string(runner.StatusSurvived))
+		}
+	}
+
+	if summary.Uncovered > 0 {
+		fmt.Fprintf(w, "\n## Action Required: %d Uncovered Mutant(s)\n", summary.Uncovered)
+		fmt.Fprintf(w, "Add tests in `%s` that execute these uncovered paths in `%s` and assert their behavior:\n",
+			summary.TestFile, summary.TargetFile)
+		for _, res := range summary.Results {
+			if !isUncoveredResult(res) {
+				continue
+			}
+			writeLLMMutant(res, string(runner.StatusUncovered))
+		}
+	}
+
 	fmt.Fprintln(w, "\n## Re-verification Command")
 	if strings.Contains(summary.TargetFile, ", ") {
 		csvTargets := strings.ReplaceAll(summary.TargetFile, ", ", ",")
 		fmt.Fprintf(w, "```bash\nbashtion --target %s --format llm\n```\n", safeShellArg(csvTargets))
+	} else if len(summary.TestFiles) > 1 {
+		var testArgs strings.Builder
+		for _, tf := range summary.TestFiles {
+			testArgs.WriteString(" --test ")
+			testArgs.WriteString(safeShellArg(tf))
+		}
+		fmt.Fprintf(w, "```bash\nbashtion --target %s%s --format llm\n```\n",
+			safeShellArg(summary.TargetFile), testArgs.String())
 	} else if summary.TestFile != "" {
 		fmt.Fprintf(w, "```bash\nbashtion --target %s --test %s --format llm\n```\n",
 			safeShellArg(summary.TargetFile), safeShellArg(summary.TestFile))
@@ -243,29 +307,37 @@ func safeShellArg(s string) string {
 }
 
 type jsonReport struct {
-	TargetFile       string       `json:"target_file"`
-	TestFile         string       `json:"test_file"`
-	BaselineTimeMs   int64        `json:"baseline_time_ms"`
-	TotalTimeMs      int64        `json:"total_time_ms"`
-	Workers          int          `json:"workers"`
-	TotalMutants     int          `json:"total_mutants"`
-	Killed           int          `json:"killed"`
-	Timeout          int          `json:"timeout"`
-	Survived         int          `json:"survived"`
-	Errors           int          `json:"errors,omitempty"`
-	Uncovered        int          `json:"uncovered,omitempty"`
-	CacheHits        int          `json:"cache_hits,omitempty"`
-	MutationScore    float64      `json:"mutation_score"`
-	MinScore         float64      `json:"min_score,omitempty"`
-	PassedThreshold  bool         `json:"passed_threshold"`
-	SurvivedMutants  []jsonMutant `json:"survived_mutants"`
-	AllMutantResults []jsonMutant `json:"all_mutant_results"`
+	TargetFile           string       `json:"target_file"`
+	TestFile             string       `json:"test_file"`
+	TestFiles            []string     `json:"test_files,omitempty"`
+	BaselineTimeMs       int64        `json:"baseline_time_ms"`
+	TotalTimeMs          int64        `json:"total_time_ms"`
+	Workers              int          `json:"workers"`
+	CoverageEnabled      bool         `json:"coverage_enabled"`
+	CacheEnabled         bool         `json:"cache_enabled"`
+	CacheFile            string       `json:"cache_file,omitempty"`
+	TotalMutants         int          `json:"total_mutants"`
+	CoveredMutants       int          `json:"covered_mutants"`
+	Killed               int          `json:"killed"`
+	Timeout              int          `json:"timeout"`
+	Survived             int          `json:"survived"`
+	Uncovered            int          `json:"uncovered"`
+	Errors               int          `json:"errors,omitempty"`
+	CacheHits            int          `json:"cache_hits,omitempty"`
+	MutationScore        float64      `json:"mutation_score"`
+	CoveredMutationScore *float64     `json:"covered_mutation_score"`
+	MinScore             float64      `json:"min_score,omitempty"`
+	PassedThreshold      bool         `json:"passed_threshold"`
+	SurvivedMutants      []jsonMutant `json:"survived_mutants"`
+	UncoveredMutants     []jsonMutant `json:"uncovered_mutants"`
+	AllMutantResults     []jsonMutant `json:"all_mutant_results"`
 }
 
 type jsonMutant struct {
 	ID          int    `json:"id"`
+	Key         string `json:"key"`
 	Status      string `json:"status"`
-	Uncovered   bool   `json:"uncovered,omitempty"`
+	Covered     *bool  `json:"covered"`
 	Cached      bool   `json:"cached,omitempty"`
 	FilePath    string `json:"file_path"`
 	FuncName    string `json:"func_name,omitempty"`
@@ -282,32 +354,55 @@ type jsonMutant struct {
 
 func writeJSON(w io.Writer, summary *runner.Summary, resolveSrc func(string) []byte, minScore float64) error {
 	score := summary.Score()
+	var covScorePtr *float64
+	if covScore, ok := summary.CoveredScore(); ok {
+		v := covScore
+		covScorePtr = &v
+	}
+	testFiles := summary.TestFiles
+	if len(testFiles) == 0 && summary.TestFile != "" {
+		testFiles = []string{summary.TestFile}
+	}
+
 	rep := jsonReport{
-		TargetFile:       summary.TargetFile,
-		TestFile:         summary.TestFile,
-		BaselineTimeMs:   summary.BaselineDuration.Milliseconds(),
-		TotalTimeMs:      summary.TotalDuration.Milliseconds(),
-		Workers:          summary.Jobs,
-		TotalMutants:     summary.Total,
-		Killed:           summary.Killed,
-		Timeout:          summary.Timeout,
-		Survived:         summary.Survived,
-		Errors:           summary.Errors,
-		Uncovered:        summary.Uncovered,
-		CacheHits:        summary.CacheHits,
-		MutationScore:    score,
-		MinScore:         minScore,
-		PassedThreshold:  summary.Errors == 0 && (minScore <= 0 || (summary.Total == 0 && summary.AllowZeroMutants) || (summary.Total > 0 && score >= minScore)),
-		SurvivedMutants:  make([]jsonMutant, 0, summary.Survived),
-		AllMutantResults: make([]jsonMutant, 0, len(summary.Results)),
+		TargetFile:           summary.TargetFile,
+		TestFile:             summary.TestFile,
+		TestFiles:            testFiles,
+		BaselineTimeMs:       summary.BaselineDuration.Milliseconds(),
+		TotalTimeMs:          summary.TotalDuration.Milliseconds(),
+		Workers:              summary.Jobs,
+		CoverageEnabled:      summary.CoverageEnabled,
+		CacheEnabled:         summary.CacheEnabled,
+		CacheFile:            summary.CacheFile,
+		TotalMutants:         summary.Total,
+		CoveredMutants:       summary.CoveredMutants(),
+		Killed:               summary.Killed,
+		Timeout:              summary.Timeout,
+		Survived:             summary.Survived,
+		Uncovered:            summary.Uncovered,
+		Errors:               summary.Errors,
+		CacheHits:            summary.CacheHits,
+		MutationScore:        score,
+		CoveredMutationScore: covScorePtr,
+		MinScore:             minScore,
+		PassedThreshold:      summary.Errors == 0 && (minScore <= 0 || (summary.Total == 0 && summary.AllowZeroMutants) || (summary.Total > 0 && score >= minScore)),
+		SurvivedMutants:      make([]jsonMutant, 0, summary.Survived),
+		UncoveredMutants:     make([]jsonMutant, 0, summary.Uncovered),
+		AllMutantResults:     make([]jsonMutant, 0, len(summary.Results)),
 	}
 
 	for _, res := range summary.Results {
 		m := res.Mutant
+		uncov := isUncoveredResult(res)
+		st := string(res.Status)
+		if uncov {
+			st = string(runner.StatusUncovered)
+		}
 		jm := jsonMutant{
 			ID:          m.ID,
-			Status:      string(res.Status),
-			Uncovered:   res.Uncovered,
+			Key:         m.Key(),
+			Status:      st,
+			Covered:     coveredPtrForResult(summary, res),
 			Cached:      res.Cached,
 			FilePath:    m.FilePath,
 			FuncName:    m.FuncName,
@@ -319,7 +414,11 @@ func writeJSON(w io.Writer, summary *runner.Summary, resolveSrc func(string) []b
 			Replacement: m.Replacement,
 			DurationMs:  res.Duration.Milliseconds(),
 		}
-		if res.Status == runner.StatusSurvived {
+		if uncov {
+			jm.Hint = hintForResult(res)
+			jm.UnifiedDiff = m.UnifiedDiff(resolveSrc(m.FilePath))
+			rep.UncoveredMutants = append(rep.UncoveredMutants, jm)
+		} else if res.Status == runner.StatusSurvived {
 			jm.Hint = hintForResult(res)
 			jm.UnifiedDiff = m.UnifiedDiff(resolveSrc(m.FilePath))
 			rep.SurvivedMutants = append(rep.SurvivedMutants, jm)
@@ -340,11 +439,11 @@ func writeMarkdown(w io.Writer, summary *runner.Summary, resolveSrc func(string)
 	}
 	fmt.Fprintln(w, "## 🛡️ bashtion Mutation Testing Report")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "| Target | Test Suite | Score | Killed | Survived | Timeout | Total | Time |")
-	fmt.Fprintln(w, "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |")
-	fmt.Fprintf(w, "| %s | %s | %s | %d | %d | %d | %d | %dms |\n",
+	fmt.Fprintln(w, "| Target | Test Suite | Score | Killed | Survived | Uncovered | Timeout | Total | Time |")
+	fmt.Fprintln(w, "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+	fmt.Fprintf(w, "| %s | %s | %s | %d | %d | %d | %d | %d | %dms |\n",
 		markdownTableCellCode(summary.TargetFile), markdownTableCellCode(summary.TestFile), scoreStr,
-		summary.Killed, summary.Survived, summary.Timeout, summary.Total,
+		summary.Killed, summary.Survived, summary.Uncovered, summary.Timeout, summary.Total,
 		summary.TotalDuration.Milliseconds(),
 	)
 
@@ -352,7 +451,11 @@ func writeMarkdown(w io.Writer, summary *runner.Summary, resolveSrc func(string)
 		fmt.Fprintf(w, "\n❌ Mutant evaluation errors: %d\n", summary.Errors)
 	}
 	if summary.Uncovered > 0 {
-		fmt.Fprintf(w, "\n- Uncovered mutants (skipped by baseline coverage): %d\n", summary.Uncovered)
+		if covScore, ok := summary.CoveredScore(); ok {
+			fmt.Fprintf(w, "\n- Uncovered mutants (skipped by baseline coverage): %d (covered-only mutation score: **%.1f%%**)\n", summary.Uncovered, covScore)
+		} else {
+			fmt.Fprintf(w, "\n- Uncovered mutants (skipped by baseline coverage): %d (covered-only mutation score: **N/A**)\n", summary.Uncovered)
+		}
 	}
 
 	if minScore > 0 {
@@ -369,32 +472,42 @@ func writeMarkdown(w io.Writer, summary *runner.Summary, resolveSrc func(string)
 		}
 	}
 
+	writeDetails := func(res runner.Result, badge string) {
+		m := res.Mutant
+		fmt.Fprintf(w, "<details>\n<summary><b>#%02d [%s]%s</b> <code>%s:%d:%d</code> — %s</summary>\n\n",
+			m.ID,
+			html.EscapeString(string(m.Category)),
+			html.EscapeString(badge),
+			html.EscapeString(m.FilePath),
+			m.Line,
+			m.Col,
+			html.EscapeString(m.Description))
+		fmt.Fprintf(w, "> **Hint**: %s\n\n", hintForResult(res))
+		diffText := m.UnifiedDiff(resolveSrc(m.FilePath))
+		openFence, closeFence := codeFence(diffText, "diff")
+		fmt.Fprintln(w, openFence)
+		fmt.Fprint(w, diffText)
+		fmt.Fprintln(w, closeFence)
+		fmt.Fprintln(w, "</details>")
+	}
+
 	if summary.Survived > 0 {
 		fmt.Fprintf(w, "\n### Survived Mutants (%d)\n\n", summary.Survived)
 		for _, res := range summary.Results {
-			if res.Status != runner.StatusSurvived {
+			if res.Status != runner.StatusSurvived || isUncoveredResult(res) {
 				continue
 			}
-			m := res.Mutant
-			uncovLabel := ""
-			if res.Uncovered {
-				uncovLabel = " [UNCOVERED]"
+			writeDetails(res, "")
+		}
+	}
+
+	if summary.Uncovered > 0 {
+		fmt.Fprintf(w, "\n### Uncovered Mutants (%d)\n\n", summary.Uncovered)
+		for _, res := range summary.Results {
+			if !isUncoveredResult(res) {
+				continue
 			}
-			fmt.Fprintf(w, "<details>\n<summary><b>#%02d [%s]%s</b> <code>%s:%d:%d</code> — %s</summary>\n\n",
-				m.ID,
-				html.EscapeString(string(m.Category)),
-				html.EscapeString(uncovLabel),
-				html.EscapeString(m.FilePath),
-				m.Line,
-				m.Col,
-				html.EscapeString(m.Description))
-			fmt.Fprintf(w, "> **Hint**: %s\n\n", hintForResult(res))
-			diffText := m.UnifiedDiff(resolveSrc(m.FilePath))
-			openFence, closeFence := codeFence(diffText, "diff")
-			fmt.Fprintln(w, openFence)
-			fmt.Fprint(w, diffText)
-			fmt.Fprintln(w, closeFence)
-			fmt.Fprintln(w, "</details>")
+			writeDetails(res, " [UNCOVERED]")
 		}
 	}
 	return nil

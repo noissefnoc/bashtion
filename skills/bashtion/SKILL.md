@@ -46,11 +46,32 @@ Run `bashtion` pointing to the target Bash script and its corresponding `.bats` 
 bashtion --target <script.sh> --test <suite.bats> --format llm
 ```
 
-If multiple files or directories are involved, use globs:
+If a single script is tested by multiple `.bats` files, pass `--test` multiple times, comma-separated, or as a glob:
+
+```bash
+bashtion --target <script.sh> --test test/unit.bats --test test/edge.bats --format llm
+bashtion --target <script.sh> --test "test/foo_*.bats" --format llm
+```
+
+If multiple target files or directories are involved, use globs:
 
 ```bash
 bashtion --target "src/**/*.sh" --format llm
 ```
+
+To inspect structured results while keeping human-readable progress on your terminal, use `--json-out`:
+
+```bash
+bashtion --target <script.sh> --test <suite.bats> --json-out report.json
+```
+
+In JSON reports, each mutant includes a deterministic `key` (16-hex SHA-256 fingerprint independent of run ordering) and an explicit `covered` boolean (`true`, `false`, or `null` when coverage is disabled). Uncovered lines are reported with `"status": "UNCOVERED"` under `uncovered_mutants` separately from covered `"SURVIVED"` mutants under `survived_mutants`, and both `mutation_score` (overall) and `covered_mutation_score` (covered-only) are provided.
+
+### Caching & Sandboxed Environments
+
+- **Default cache path**: `${XDG_CACHE_HOME:-~/.cache}/bashtion/<project-hash>.json` (falls back to `./.bashtion-cache.json` if home/cache directories cannot be resolved).
+- **Writable sandbox cache**: If your agent sandbox makes `~/.cache` read-only, point caching to a writable directory via `--cache-file /tmp/bashtion-cache.json` (or set `XDG_CACHE_HOME`).
+- **Disabling cache**: Pass `--no-cache` to disable reading and writing cache completely (recommended for authoritative CI `--min-score` gates or ephemeral runs). Do **not** pass both `--no-cache` and `--cache-file` together — `--no-cache` always takes precedence.
 
 ---
 

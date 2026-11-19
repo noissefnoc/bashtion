@@ -38,9 +38,9 @@ func TestResolvePairs_GlobConventionSourceAnalysisAndExplicitMappings(t *testing
 	pairs, err := discovery.ResolvePairs(
 		workDir,
 		[]string{"src/**/*.sh"},
-		"",
-		map[string]string{
-			"src/mapped.sh": "custom/explicit_test.bats",
+		nil,
+		map[string][]string{
+			"src/mapped.sh": {"custom/explicit_test.bats"},
 		},
 		false,
 	)
@@ -49,10 +49,10 @@ func TestResolvePairs_GlobConventionSourceAnalysisAndExplicitMappings(t *testing
 	}
 
 	want := []discovery.TargetPair{
-		{TargetFile: filepath.FromSlash("src/custom_loader.sh"), TestFile: filepath.FromSlash("specs/loader_suite.bats")},
-		{TargetFile: filepath.FromSlash("src/deploy.sh"), TestFile: filepath.FromSlash("test/deploy.bats")},
-		{TargetFile: filepath.FromSlash("src/mapped.sh"), TestFile: filepath.FromSlash("custom/explicit_test.bats")},
-		{TargetFile: filepath.FromSlash("src/sub/auth.sh"), TestFile: filepath.FromSlash("tests/sub/auth.bats")},
+		{TargetFile: filepath.FromSlash("src/custom_loader.sh"), TestFiles: []string{filepath.FromSlash("specs/loader_suite.bats")}},
+		{TargetFile: filepath.FromSlash("src/deploy.sh"), TestFiles: []string{filepath.FromSlash("test/deploy.bats")}},
+		{TargetFile: filepath.FromSlash("src/mapped.sh"), TestFiles: []string{filepath.FromSlash("custom/explicit_test.bats")}},
+		{TargetFile: filepath.FromSlash("src/sub/auth.sh"), TestFiles: []string{filepath.FromSlash("tests/sub/auth.bats")}},
 	}
 
 	if diff := cmp.Diff(want, pairs); diff != "" {
@@ -73,11 +73,11 @@ func TestResolvePairs_SameDirectoryConventionAndDirectoryTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pairs, err := discovery.ResolvePairs(workDir, []string{"examples"}, "", nil, false)
+	pairs, err := discovery.ResolvePairs(workDir, []string{"examples"}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("ResolvePairs failed: %v", err)
 	}
-	if len(pairs) != 1 || pairs[0].TargetFile != filepath.FromSlash("examples/helper.sh") || pairs[0].TestFile != filepath.FromSlash("examples/helper.bats") {
+	if len(pairs) != 1 || pairs[0].TargetFile != filepath.FromSlash("examples/helper.sh") || !cmp.Equal(pairs[0].TestFiles, []string{filepath.FromSlash("examples/helper.bats")}) {
 		t.Errorf("unexpected pairs: %+v", pairs)
 	}
 }
@@ -143,16 +143,16 @@ func TestResolvePairs_NoBasenameCollisionAndLiteralCommaFilename(t *testing.T) {
 	}
 
 	// src/common.sh must NOT collide onto a_lib_suite.bats.
-	if _, err := discovery.ResolvePairs(workDir, []string{"src/common.sh"}, "", nil, false); err == nil {
+	if _, err := discovery.ResolvePairs(workDir, []string{"src/common.sh"}, nil, nil, false); err == nil {
 		t.Fatal("expected error when src/common.sh has no matching test (must not mis-pair lib/common.sh test)")
 	}
 
 	// lib/common.sh MUST pair with test/a_lib_suite.bats.
-	pairs, err := discovery.ResolvePairs(workDir, []string{"lib/common.sh"}, "", nil, false)
+	pairs, err := discovery.ResolvePairs(workDir, []string{"lib/common.sh"}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("ResolvePairs failed for lib/common.sh: %v", err)
 	}
-	if len(pairs) != 1 || filepath.ToSlash(pairs[0].TestFile) != "test/a_lib_suite.bats" {
+	if len(pairs) != 1 || len(pairs[0].TestFiles) != 1 || filepath.ToSlash(pairs[0].TestFiles[0]) != "test/a_lib_suite.bats" {
 		t.Fatalf("expected test/a_lib_suite.bats, got: %+v", pairs)
 	}
 
@@ -160,13 +160,13 @@ func TestResolvePairs_NoBasenameCollisionAndLiteralCommaFilename(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workDir, "test", "z_src_suite.bats"), []byte("source \"../src/common.sh\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	bothPairs, err := discovery.ResolvePairs(workDir, []string{"src/common.sh", "lib/common.sh"}, "", nil, false)
+	bothPairs, err := discovery.ResolvePairs(workDir, []string{"src/common.sh", "lib/common.sh"}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("ResolvePairs failed for both common.sh files: %v", err)
 	}
 	if len(bothPairs) != 2 ||
-		filepath.ToSlash(bothPairs[0].TestFile) != "test/z_src_suite.bats" ||
-		filepath.ToSlash(bothPairs[1].TestFile) != "test/a_lib_suite.bats" {
+		len(bothPairs[0].TestFiles) != 1 || filepath.ToSlash(bothPairs[0].TestFiles[0]) != "test/z_src_suite.bats" ||
+		len(bothPairs[1].TestFiles) != 1 || filepath.ToSlash(bothPairs[1].TestFiles[0]) != "test/a_lib_suite.bats" {
 		t.Fatalf("unexpected pairing for common.sh files: %+v", bothPairs)
 	}
 
@@ -204,27 +204,27 @@ func TestResolvePairs_ExplicitTestScopeAndSingleSharedTestFallback(t *testing.T)
 	}
 
 	// 1. Explicit test directory `tests/smoke` must NOT pick `tests/a.bats` outside it, and must fail for `src/b.sh`.
-	if _, err := discovery.ResolvePairs(workDir, []string{"src/*.sh"}, "tests/smoke", nil, false); err == nil {
+	if _, err := discovery.ResolvePairs(workDir, []string{"src/*.sh"}, []string{"tests/smoke"}, nil, false); err == nil {
 		t.Fatal("expected error when src/b.sh has no matching .bats inside tests/smoke")
 	}
 
 	// 2. Explicit single test directory matching a.sh picks tests/smoke/a.bats.
-	smokePairs, err := discovery.ResolvePairs(workDir, []string{"src/a.sh"}, "tests/smoke", nil, false)
+	smokePairs, err := discovery.ResolvePairs(workDir, []string{"src/a.sh"}, []string{"tests/smoke"}, nil, false)
 	if err != nil {
 		t.Fatalf("ResolvePairs with tests/smoke failed: %v", err)
 	}
-	if len(smokePairs) != 1 || filepath.ToSlash(smokePairs[0].TestFile) != "tests/smoke/a.bats" {
+	if len(smokePairs) != 1 || len(smokePairs[0].TestFiles) != 1 || filepath.ToSlash(smokePairs[0].TestFiles[0]) != "tests/smoke/a.bats" {
 		t.Errorf("expected tests/smoke/a.bats, got: %+v", smokePairs)
 	}
 
 	// 3. Explicit single shared test file with multiple targets falls back to that test file.
-	sharedPairs, err := discovery.ResolvePairs(workDir, []string{"src/*.sh"}, "tests/all_suite.bats", nil, false)
+	sharedPairs, err := discovery.ResolvePairs(workDir, []string{"src/*.sh"}, []string{"tests/all_suite.bats"}, nil, false)
 	if err != nil {
 		t.Fatalf("ResolvePairs with shared test file failed: %v", err)
 	}
 	want := []discovery.TargetPair{
-		{TargetFile: filepath.FromSlash("src/a.sh"), TestFile: filepath.FromSlash("tests/all_suite.bats")},
-		{TargetFile: filepath.FromSlash("src/b.sh"), TestFile: filepath.FromSlash("tests/all_suite.bats")},
+		{TargetFile: filepath.FromSlash("src/a.sh"), TestFiles: []string{filepath.FromSlash("tests/all_suite.bats")}},
+		{TargetFile: filepath.FromSlash("src/b.sh"), TestFiles: []string{filepath.FromSlash("tests/all_suite.bats")}},
 	}
 	if diff := cmp.Diff(want, sharedPairs); diff != "" {
 		t.Errorf("shared test fallback mismatch (-want +got):\n%s", diff)
@@ -262,5 +262,86 @@ func TestResolveTargets_SymlinksAndNestedBraceWildcards(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, targets); diff != "" {
 		t.Errorf("symlink + nested brace glob mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestResolvePairs_MultiTestFilesAndDetailedDiscoveryError(t *testing.T) {
+	workDir := t.TempDir()
+	for _, d := range []string{"scripts", "test"} {
+		if err := os.MkdirAll(filepath.Join(workDir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{
+		"scripts/app.sh":      "#!/usr/bin/env bash\n",
+		"scripts/orphan.sh":   "#!/usr/bin/env bash\n",
+		"test/app.bats":       "#!/usr/bin/env bats\nsource ../scripts/app.sh\n",
+		"test/app_extra.bats": "#!/usr/bin/env bats\nsource ../scripts/app.sh\n",
+		"test/unrelated.bats": "#!/usr/bin/env bats\necho hi\n",
+	}
+	for rel, content := range files {
+		if err := os.WriteFile(filepath.Join(workDir, filepath.FromSlash(rel)), []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. Auto-discovery collects all matching .bats files (convention + source refs).
+	autoPairs, err := discovery.ResolvePairs(workDir, []string{"scripts/app.sh"}, nil, nil, false)
+	if err != nil {
+		t.Fatalf("auto-discovery multi-test failed: %v", err)
+	}
+	wantAuto := []discovery.TargetPair{{
+		TargetFile: "scripts/app.sh",
+		TestFiles:  []string{filepath.FromSlash("test/app.bats"), filepath.FromSlash("test/app_extra.bats")},
+	}}
+	if diff := cmp.Diff(wantAuto, autoPairs); diff != "" {
+		t.Errorf("auto-discovery multi-test mismatch (-want +got):\n%s", diff)
+	}
+
+	// 2. Explicit repeatable & comma-separated concrete test files for single target.
+	explicitPairs, err := discovery.ResolvePairs(workDir, []string{"scripts/orphan.sh"}, []string{"test/app.bats,test/app_extra.bats", "test/unrelated.bats"}, nil, false)
+	if err != nil {
+		t.Fatalf("explicit multi-test failed: %v", err)
+	}
+	wantExplicit := []discovery.TargetPair{{
+		TargetFile: "scripts/orphan.sh",
+		TestFiles:  []string{"test/app.bats", "test/app_extra.bats", "test/unrelated.bats"},
+	}}
+	if diff := cmp.Diff(wantExplicit, explicitPairs); diff != "" {
+		t.Errorf("explicit multi-test mismatch (-want +got):\n%s", diff)
+	}
+
+	// 3. Explicit glob pattern for single target selects all matched .bats files.
+	globPairs, err := discovery.ResolvePairs(workDir, []string{"scripts/orphan.sh"}, []string{"test/app*.bats"}, nil, false)
+	if err != nil {
+		t.Fatalf("glob multi-test failed: %v", err)
+	}
+	wantGlob := []discovery.TargetPair{{
+		TargetFile: "scripts/orphan.sh",
+		TestFiles:  []string{filepath.FromSlash("test/app.bats"), filepath.FromSlash("test/app_extra.bats")},
+	}}
+	if diff := cmp.Diff(wantGlob, globPairs); diff != "" {
+		t.Errorf("glob multi-test mismatch (-want +got):\n%s", diff)
+	}
+
+	// 4. Discovery failure returns detailed naming conventions, scanned count, and hint.
+	_, err = discovery.ResolvePairs(workDir, []string{"scripts/orphan.sh"}, nil, nil, false)
+	if err == nil {
+		t.Fatal("expected discovery error for scripts/orphan.sh")
+	}
+	msg := err.Error()
+	for _, wantSub := range []string{
+		`could not auto-discover a .bats test file for "scripts/orphan.sh"`,
+		"checked naming conventions:",
+		"scripts/orphan.bats",
+		"test/scripts/orphan.bats",
+		"test/orphan.bats",
+		"checked source/load directives in 3 .bats file(s) in workspace",
+		"hint: pass --test <file.bats>",
+		"[mappings]",
+	} {
+		if !strings.Contains(msg, wantSub) {
+			t.Errorf("expected discovery error to contain %q, got:\n%s", wantSub, msg)
+		}
 	}
 }

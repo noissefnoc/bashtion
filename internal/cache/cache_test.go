@@ -63,16 +63,18 @@ func TestStore_LoadPutSaveAndComputeKey(t *testing.T) {
 		t.Errorf("expected empty store after corrupted json")
 	}
 
-	// Old schema v1 cache file must be rejected cleanly
-	if err := os.WriteFile(cachePath, []byte(`{"version":"1","entries":{"abc":{"status":"KILLED"}}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	v1Store, err := cache.Load(cachePath)
-	if err != nil {
-		t.Fatalf("expected nil error on stale schema load, got %v", err)
-	}
-	if _, ok := v1Store.Get("abc"); ok {
-		t.Errorf("expected schema v1 entries to be discarded")
+	// Old schema v1 and v2 cache files must be rejected cleanly
+	for _, oldVer := range []string{"1", "2"} {
+		if err := os.WriteFile(cachePath, []byte(`{"version":"`+oldVer+`","entries":{"abc":{"status":"KILLED"}}}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		oldStore, err := cache.Load(cachePath)
+		if err != nil {
+			t.Fatalf("expected nil error on stale schema v%s load, got %v", oldVer, err)
+		}
+		if _, ok := oldStore.Get("abc"); ok {
+			t.Errorf("expected schema v%s entries to be discarded", oldVer)
+		}
 	}
 
 	// Extra metadata arguments affect ComputeKey deterministically

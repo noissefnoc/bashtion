@@ -385,8 +385,8 @@ func TestMainCommandWithDeps_OmittedTestResolvesInWorkDirAndFailsWhenMissing(t *
 			return []byte("ok 1\n"), nil
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "could not auto-discover a .bats file") {
-		t.Fatalf("expected discovery failure when matching .bats is missing in WorkDir, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "could not auto-discover a .bats test file") || !strings.Contains(err.Error(), "checked naming conventions:") || !strings.Contains(err.Error(), "solo.bats") {
+		t.Fatalf("expected detailed discovery failure when matching .bats is missing in WorkDir, got: %v", err)
 	}
 
 	// Now add matching solo.bats in deps.WorkDir (not cwd!) and verify omitted --test resolves and runs.
@@ -531,5 +531,117 @@ func TestMainCommandWithDeps_GitDiffZeroMutantsPassesMinScore_AndWorkDirReadIsol
 		},
 	}); err == nil {
 		t.Errorf("expected error when 0 mutants generated with --min-score without --git-diff")
+	}
+}
+
+func TestMainCommandWithDeps_JSONProgressQuietJSONOutAndCacheSaveHint(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptPath := filepath.Join(tmpDir, "check.sh")
+	testA := filepath.Join(tmpDir, "a.bats")
+	testB := filepath.Join(tmpDir, "b.bats")
+	if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\nif [[ \"$1\" -eq 0 ]]; then return 0; fi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(testA, []byte("# bats a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(testB, []byte("# bats b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeExec := func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte("ok 1\n"), nil
+	}
+
+	// 1. --format json emits progress to stderr by default while keeping stdout valid JSON.
+	jsonStdout := &bytes.Buffer{}
+	jsonStderr := &bytes.Buffer{}
+	err := MainCommandWithDeps(&Options{
+		Target:  "check.sh",
+		Test:    "a.bats",
+		Tests:   []string{"b.bats"},
+		BatsBin: "bats",
+		Jobs:    1,
+		Format:  report.FormatJSON,
+		NoCache: true,
+	}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: jsonStdout,
+		Stderr: jsonStderr,
+	}, Deps{WorkDir: tmpDir, Executor: fakeExec})
+	if err != nil {
+		t.Fatalf("json run failed: %v", err)
+	}
+	if !strings.Contains(jsonStderr.String(), "[01/") || !strings.Contains(jsonStderr.String(), "Cache:  disabled (--no-cache)") {
+		t.Errorf("expected stderr progress and cache header in json mode, got:\n%s", jsonStderr.String())
+	}
+	if !strings.HasPrefix(strings.TrimSpace(jsonStdout.String()), "{") {
+		t.Errorf("expected pure JSON on stdout, got:\n%s", jsonStdout.String())
+	}
+
+	// 2. --quiet suppresses stderr progress completely.
+	quietStderr := &bytes.Buffer{}
+	err = MainCommandWithDeps(&Options{
+		Target:  "check.sh",
+		Test:    "a.bats",
+		BatsBin: "bats",
+		Jobs:    1,
+		Format:  report.FormatJSON,
+		Quiet:   true,
+		NoCache: true,
+	}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: &bytes.Buffer{},
+		Stderr: quietStderr,
+	}, Deps{WorkDir: tmpDir, Executor: fakeExec})
+	if err != nil {
+		t.Fatalf("quiet run failed: %v", err)
+	}
+	if strings.Contains(quietStderr.String(), "[01/") {
+		t.Errorf("expected --quiet to suppress stderr progress, got:\n%s", quietStderr.String())
+	}
+
+	// 3. --format text + --json-out writes both text stdout and JSON file, and read-only cache path emits sandbox hint.
+	roDir := filepath.Join(tmpDir, "readonly-dir")
+	if err := os.MkdirAll(roDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o755) })
+	unwritableCache := filepath.Join(roDir, "sub", "cache.json")
+
+	dualStdout := &bytes.Buffer{}
+	dualStderr := &bytes.Buffer{}
+	jsonOutRel := filepath.Join("out", "report.json")
+	err = MainCommandWithDeps(&Options{
+		Target:    "check.sh",
+		Test:      "a.bats",
+		Tests:     []string{"b.bats"},
+		BatsBin:   "bats",
+		Jobs:      1,
+		Format:    report.FormatText,
+		JSONOut:   jsonOutRel,
+		CacheFile: unwritableCache,
+	}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: dualStdout,
+		Stderr: dualStderr,
+	}, Deps{WorkDir: tmpDir, Executor: fakeExec})
+	if err != nil {
+		t.Fatalf("dual output run failed: %v", err)
+	}
+	if !strings.Contains(dualStdout.String(), "bashtion: Mutation Testing Summary") {
+		t.Errorf("expected text report on stdout, got:\n%s", dualStdout.String())
+	}
+	jsonBytes, readErr := os.ReadFile(filepath.Join(tmpDir, jsonOutRel))
+	if readErr != nil {
+		t.Fatalf("expected --json-out file to be written: %v", readErr)
+	}
+	if !strings.Contains(string(jsonBytes), `"test_files"`) || !strings.Contains(string(jsonBytes), `"key"`) {
+		t.Errorf("expected valid JSON report in --json-out file, got:\n%s", string(jsonBytes))
+	}
+	if os.Geteuid() != 0 {
+		if !strings.Contains(dualStderr.String(), "failed to write cache file") || !strings.Contains(dualStderr.String(), "--cache-file") {
+			t.Errorf("expected actionable cache save warning in stderr, got:\n%s", dualStderr.String())
+		}
 	}
 }

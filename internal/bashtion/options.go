@@ -21,19 +21,75 @@ import (
 // DefaultConfigFile is the default config filename looked up when present in the working directory.
 const DefaultConfigFile = ".bashtion.toml"
 
+// ProgressMode controls progress output emitted to stderr during mutation testing.
+type ProgressMode string
+
+const (
+	ProgressAuto   ProgressMode = "auto"
+	ProgressAlways ProgressMode = "always"
+	ProgressNever  ProgressMode = "never"
+)
+
+// ParseProgressMode validates and normalizes a --progress mode value.
+func ParseProgressMode(s string) (ProgressMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "auto":
+		return ProgressAuto, nil
+	case "always", "on":
+		return ProgressAlways, nil
+	case "never", "off":
+		return ProgressNever, nil
+	default:
+		return "", fmt.Errorf("unsupported --progress value %q (valid: auto, always, never)", s)
+	}
+}
+
+type repeatableTestFlag struct {
+	first *string
+	rest  *[]string
+}
+
+func (f *repeatableTestFlag) String() string {
+	if f == nil || f.first == nil {
+		return ""
+	}
+	if f.rest == nil || len(*f.rest) == 0 {
+		return *f.first
+	}
+	all := make([]string, 0, 1+len(*f.rest))
+	if *f.first != "" {
+		all = append(all, *f.first)
+	}
+	all = append(all, *f.rest...)
+	return strings.Join(all, ",")
+}
+
+func (f *repeatableTestFlag) Set(val string) error {
+	if *f.first == "" {
+		*f.first = val
+	} else {
+		*f.rest = append(*f.rest, val)
+	}
+	return nil
+}
+
 // Options holds parsed and merged command-line options for bashtion.
 type Options struct {
 	Config             string
 	Target             string
 	Targets            []string
 	Test               string
-	Mappings           map[string]string
+	Tests              []string
+	Mappings           map[string][]string
 	BatsBin            string
 	BatsArgs           []string
 	Jobs               int
 	List               bool
 	Timeout            time.Duration
 	Format             report.Format
+	JSONOut            string
+	Progress           ProgressMode
+	Quiet              bool
 	MinScore           float64
 	GitDiff            string
 	NoCache            bool
@@ -55,6 +111,16 @@ func (o *Options) TargetPatterns() []string {
 		out = append(out, o.Target)
 	}
 	out = append(out, o.Targets...)
+	return out
+}
+
+// TestPatterns returns all configured test patterns (combining Test and Tests).
+func (o *Options) TestPatterns() []string {
+	var out []string
+	if o.Test != "" {
+		out = append(out, o.Test)
+	}
+	out = append(out, o.Tests...)
 	return out
 }
 
@@ -88,13 +154,15 @@ func ParseOptions(args []string, inout *cli.ProcInout) (*Options, error) {
 		wsIncludeCSV   string
 		wsExcludeCSV   string
 		formatStr      string
+		progressStr    string
 		batsArgsStr    string
 	)
+	testFlag := &repeatableTestFlag{first: &options.Test, rest: &options.Tests}
 
 	flags.StringVar(&options.Config, "config", "", "Path to config file (default: .bashtion.toml if present)")
 	flags.StringVar(&options.Target, "target", "", "Path, directory, or glob pattern for target Bash script(s) (e.g. src/**/*.sh)")
 	flags.StringVar(&options.Target, "t", "", "Alias for --target")
-	flags.StringVar(&options.Test, "test", "", "Path to bats test file (.bats) (auto-discovered if omitted for existing scripts)")
+	flags.Var(testFlag, "test", "Path to bats test file(s), directory, or glob (repeatable or comma-separated; auto-discovered if omitted)")
 	flags.StringVar(&options.BatsBin, "bats", "bats", "bats executable name or path")
 	flags.StringVar(&batsArgsStr, "bats-args", "", "Pass-through arguments to bats (e.g. --filter <regex>)")
 	flags.IntVar(&options.Jobs, "jobs", DefaultJobs(), "Number of parallel worker jobs")
@@ -102,11 +170,15 @@ func ParseOptions(args []string, inout *cli.ProcInout) (*Options, error) {
 	flags.BoolVar(&options.List, "list", false, "Only list generated mutants without running tests")
 	flags.DurationVar(&options.Timeout, "timeout", 0, "Per-mutant timeout (default: max(5s, 5x baseline))")
 	flags.StringVar(&formatStr, "format", "text", "Output report format: text, llm, json, markdown")
+	flags.StringVar(&options.JSONOut, "json-out", "", "Write JSON report to file path in addition to the primary --format stdout report")
+	flags.StringVar(&progressStr, "progress", "", "Progress output to stderr: auto, always, never (default: auto; emits for text/json/markdown, suppresses non-TTY llm)")
+	flags.BoolVar(&options.Quiet, "quiet", false, "Suppress progress output on stderr (alias for --progress never)")
+	flags.BoolVar(&options.Quiet, "q", false, "Alias for --quiet")
 	flags.Float64Var(&options.MinScore, "min-score", 0, "Minimum required mutation score percentage (0-100)")
 	flags.StringVar(&options.GitDiff, "git-diff", "", "Only mutate lines changed in git diff against <ref> (e.g. HEAD, main)")
-	flags.BoolVar(&options.NoCache, "no-cache", false, "Disable incremental result cache (recommended for CI gates)")
+	flags.BoolVar(&options.NoCache, "no-cache", false, "Disable incremental result cache completely (overrides --cache-file; recommended for CI gates and read-only sandboxes)")
 	flags.BoolVar(&options.NoCoverage, "no-coverage", false, "Disable baseline line coverage instrumentation")
-	flags.StringVar(&options.CacheFile, "cache-file", "", "Path to incremental cache file (default: ${XDG_CACHE_HOME:-~/.cache}/bashtion/<project-hash>.json)")
+	flags.StringVar(&options.CacheFile, "cache-file", "", "Path to incremental cache file; caching is enabled by default unless --no-cache is set (default: ${XDG_CACHE_HOME:-~/.cache}/bashtion/<project-hash>.json, fallback: ./.bashtion-cache.json)")
 	flags.StringVar(&options.Workspace, "workspace", "", "Explicit workspace root directory copied into mutant sandboxes")
 	flags.StringVar(&wsIncludeCSV, "workspace-include", "", "Comma-separated workspace paths/patterns to include despite default skips (e.g. .git,node_modules/bats-support)")
 	flags.StringVar(&wsExcludeCSV, "workspace-exclude", "", "Comma-separated workspace paths/patterns to exclude from mutant sandboxes")
@@ -145,6 +217,14 @@ func ParseOptions(args []string, inout *cli.ProcInout) (*Options, error) {
 	}
 	options.Format = parsedFormat
 
+	if progressStr != "" {
+		parsedProgress, progErr := ParseProgressMode(progressStr)
+		if progErr != nil {
+			return nil, progErr
+		}
+		options.Progress = parsedProgress
+	}
+
 	setFlags := make(map[string]bool)
 	flags.Visit(func(f *flag.Flag) {
 		name := f.Name
@@ -153,11 +233,21 @@ func ParseOptions(args []string, inout *cli.ProcInout) (*Options, error) {
 			name = "target"
 		case "j":
 			name = "jobs"
+		case "q":
+			name = "quiet"
 		case "v":
 			name = "version"
 		}
 		setFlags[name] = true
 	})
+
+	if setFlags["quiet"] && options.Quiet && setFlags["progress"] && options.Progress == ProgressAlways {
+		return nil, errors.New("cannot combine --quiet with --progress always")
+	}
+
+	if setFlags["no-cache"] && options.NoCache && setFlags["cache-file"] && options.CacheFile != "" && inout.Stderr != nil {
+		fmt.Fprintf(inout.Stderr, "warning: both --no-cache and --cache-file were specified; --no-cache takes precedence and caching is disabled (omit --cache-file to disable cache, or omit --no-cache to use %q)\n", options.CacheFile)
+	}
 
 	// Load config file if --config is specified, or if .bashtion.toml exists in current directory,
 	// or fallback to XDG config directory ($XDG_CONFIG_HOME/bashtion/config.toml or ~/.config/bashtion/config.toml)
@@ -231,15 +321,20 @@ func applyFileConfigWithWarnings(opts *Options, fileCfg *FileConfig, setFlags ma
 			opts.Targets = append(opts.Targets, fileCfg.Targets...)
 		}
 	}
-	if !setFlags["test"] && fileCfg.Test != "" {
-		opts.Test = fileCfg.Test
+	if !setFlags["test"] {
+		if fileCfg.Test != "" {
+			opts.Test = fileCfg.Test
+		}
+		if len(fileCfg.Tests) > 0 {
+			opts.Tests = append(opts.Tests, fileCfg.Tests...)
+		}
 	}
 	if len(fileCfg.Mappings) > 0 {
 		if opts.Mappings == nil {
-			opts.Mappings = make(map[string]string, len(fileCfg.Mappings))
+			opts.Mappings = make(map[string][]string, len(fileCfg.Mappings))
 		}
 		for k, v := range fileCfg.Mappings {
-			opts.Mappings[k] = v
+			opts.Mappings[k] = append([]string(nil), v...)
 		}
 	}
 	if !setFlags["bats"] && fileCfg.BatsBin != "" {
@@ -256,6 +351,19 @@ func applyFileConfigWithWarnings(opts *Options, fileCfg *FileConfig, setFlags ma
 	}
 	if !setFlags["format"] && fileCfg.Format != "" {
 		opts.Format = fileCfg.Format
+	}
+	if !setFlags["json-out"] && fileCfg.JSONOut != "" {
+		if filepath.IsLocal(filepath.Clean(fileCfg.JSONOut)) {
+			opts.JSONOut = fileCfg.JSONOut
+		} else if stderr != nil {
+			fmt.Fprintf(stderr, "warning: ignoring non-local json_out %q in config (pass --json-out explicitly to override)\n", fileCfg.JSONOut)
+		}
+	}
+	if !setFlags["progress"] && !setFlags["quiet"] && fileCfg.Progress != "" {
+		opts.Progress = fileCfg.Progress
+	}
+	if !setFlags["quiet"] && !setFlags["progress"] && fileCfg.Quiet {
+		opts.Quiet = fileCfg.Quiet
 	}
 	if !setFlags["min-score"] && fileCfg.MinScore > 0 {
 		opts.MinScore = fileCfg.MinScore
