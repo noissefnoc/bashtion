@@ -19,7 +19,7 @@
 - **高速な並列実行 (`--jobs`) & ワーカー独立サンドボックス**
   - シングルパスのインメモリ・マニフェストキャッシュにより、ホスト側の元ファイルを保護しつつシンボリックリンクを維持したワーカー別一時ワークスペースを高速構築し、変異した関数に関連する `@test` のみを自動抽出して `bats --filter` 実行するスマートルーティングを備えています。
 - **Baseline 行カバレッジ連携 (`BASH_XTRACEFD` + `PS4`) & インクリメンタルキャッシュ (`XDG_CACHE_HOME`)**
-  - 単一の Baseline 実行時に動的 FD 割り当て（`{__bashtion_cov_fd}`）で行単位のカバレッジと通過テストの対応表を収集し、未実行行の即時 `SURVIVED [UNCOVERED]` 判定および動的テストルーティングを行います。さらに、関数スコープと `.bats` のハッシュに基づくインクリメンタルキャッシュにより2回目以降の実行を高速化します。
+  - 単一の Baseline 実行時に動的 FD 割り当て（`{__bashtion_cov_fd}`）で行単位のカバレッジと通過テストの対応表を収集し、未実行行を独立ステータス `UNCOVERED`（カバー済みの `SURVIVED` と分離、全体スコアとカバー済みスコアを併記）として 0ms でスキップ判定します。さらに、関数スコープと `.bats` のハッシュに基づくインクリメンタルキャッシュにより2回目以降の実行を高速化します。
 - **マルチファイル・Glob 指定 & `.bats` 自動マッピング**
   - `--target "src/**/*.sh"` のような Glob / ディレクトリ指定と、`.bashtion.toml` 明示設定・`.bats` 内の `source`/`load` 静的解析・ファイル名規約を組み合わせた自動マッピングに対応しています。
 - **プロセスグループ単位のタイムアウト制御**
@@ -182,18 +182,21 @@ Mutation Score: 86.4%
 | オプション | デフォルト | 説明 |
 | :--- | :--- | :--- |
 | `--target <path/glob>`, `-t` | (必須) | 変異対象となる Bash スクリプト (`.sh`) のパス、ディレクトリ、または Glob（例: `src/**/*.sh`） |
-| `--test <path>` | (自動探索可) | 実行する `bats-core` テストファイルまたはディレクトリ。省略時は `source`/`load` 解析およびファイル名規約で自動マッピング。複数ターゲットに対して個別一致がなく `--test` に単一の `.bats` ファイルが指定された場合は、全ターゲットがそのファイルへフォールバックします |
+| `--test <path>` | (自動探索可) | 実行する `bats-core` テストファイル、ディレクトリ、または Glob。複数回指定（`--test a.bats --test b.bats`）やカンマ区切り（`--test a.bats,b.bats`）に対応。省略時は命名規約と `source`/`load` 解析で該当する全 `.bats` ファイルを自動マッピングします |
 | `--config <path>` | `.bashtion.toml` | 設定ファイルのパス（カレントの `.bashtion.toml` または `${XDG_CONFIG_HOME:-~/.config}/bashtion/config.toml` が存在すれば自動読み込み） |
 | `--bats <bin>` | `"bats"` | `bats` 実行バイナリ名またはパス |
 | `--bats-args <args>` | `""` | `bats` への追加パススルー引数（例: `--bats-args "--filter smoke"`。`--filter`/`-f` 指定時は Bashtion の自動フィルタを無効化） |
 | `--jobs <N>`, `-j` | CPU コア数 | 並列テストワーカー数 |
 | `--timeout <dur>` | `max(5s, 5x baseline)` | 1ミュータントあたりのタイムアウト時間（例: `3s`） |
 | `--format <fmt>` | `"text"` | 出力形式: `text`, `llm`, `json`, `markdown` |
+| `--json-out <path>` | `""` | 標準出力の `--format` レポートに加えて、JSON レポートを `<path>` に同時出力（`text` を流しながら JSON 保存が可能） |
+| `--progress <mode>` | `"auto"` | `stderr` への進捗出力モード: `auto`, `always`, `never`（`auto` は `text`/`json`/`markdown` で出力し、非 TTY の `llm` では抑止） |
+| `--quiet`, `-q` | `false` | `stderr` の進捗出力を抑止（`--progress never` のエイリアス） |
 | `--min-score <float>` | `0` (無効) | 要求する最低 Mutation Score (0〜100)。未達時は終了コード 1（`--git-diff` 併用時に変更行からミュータントが 0 件だった場合は許容され成功となります） |
 | `--git-diff <ref>` | `""` (全行対象) | 指定した Git ref（例: `HEAD`, `origin/main`）との変更行のみを変異。変更対象にミュータント 0 件の場合、`--min-score` 指定時も正常終了します |
-| `--no-cache` | `false` | インクリメンタル結果キャッシュを無効化（CI ゲートでは指定を推奨） |
+| `--no-cache` | `false` | インクリメンタル結果キャッシュを完全に無効化（`--cache-file` より優先。CI ゲートや読み取り専用サンドボックスで推奨） |
 | `--no-coverage` | `false` | Baseline 行カバレッジ計測を無効化 |
-| `--cache-file <path>` | `${XDG_CACHE_HOME:-~/.cache}/bashtion/<hash>.json` | インクリメンタルキャッシュファイルの保存先パスを明示指定 |
+| `--cache-file <path>` | `${XDG_CACHE_HOME:-~/.cache}/bashtion/<hash>.json` | インクリメンタルキャッシュファイルの保存先パスを明示指定（`--no-cache` 未指定時はデフォルト有効、ホーム未解決時は `./.bashtion-cache.json`） |
 | `--workspace <dir>` | (自動) | サンドボックスへコピーするワークスペースルートディレクトリを明示指定 |
 | `--workspace-include` | `""` | デフォルト除外を上書きして含めるパス／パターン（カンマ区切り、例: `.git,node_modules/bats-support`） |
 | `--workspace-exclude` | `""` | サンドボックスから除外するパス／パターン（カンマ区切り） |
@@ -207,18 +210,27 @@ Mutation Score: 86.4%
 ```toml
 target = "examples/deploy_helper.sh"
 test = "examples/deploy_helper.bats"
-# 複数ターゲットや明示マッピングを使う場合:
+# 複数テストスイート・複数ターゲットや明示マッピングを使う場合:
 # targets = ["src/**/*.sh"]
+# tests = ["test/unit.bats", "test/integration.bats"]
 # [mappings]
-# "src/custom.sh" = "test/custom_suite.bats"
+# "src/custom.sh" = ["test/custom_unit.bats", "test/custom_edge.bats"]
 bats = "bats"
 jobs = 4
 timeout = "5s"
 format = "text"
+# json_out = "reports/bashtion.json"
+# progress = "auto" # auto | always | never
 min_score = 80.0
 no_cache = false
 disabled_categories = ["BOOL_CMD"]
 ```
+
+> [!NOTE]
+> **v0.2.0 におけるレポート・JSON スキーマの破壊的変更**:
+> - 未カバーのミュータントは独立ステータス `"UNCOVERED"` として `"SURVIVED"` から分離され、JSON の `uncovered_mutants` に格納されます（`killed + timeout + survived + uncovered + errors == total_mutants`）。
+> - 各ミュータントに実行非依存の決定的 16 桁 hex キー `key` および明示的な `covered` (`true` | `false` | `null`) フィールドを追加しました。
+> - トップレベル JSON に `covered_mutants`・`covered_mutation_score`（従来の全体スコア `mutation_score` と併記）・`coverage_enabled`・`cache_enabled`・`cache_file`・`test_files` を追加しました。
 
 ### コメントによる変異除外（Pragma）
 
@@ -266,7 +278,6 @@ return 0
 
 ### 既知の制約事項と今後の課題 (Known Limitations)
 
-- **1ターゲットにつき単一の `.bats` ファイルとのペアリング**: 自動探索および `--test <dir>` 指定時は、各ターゲットスクリプトに対して最も優先度の高い1つの `.bats` ファイルがペアリングされます。1つのスクリプトに対するテストが複数の `.bats` ファイルに分割されている場合は、`--test` で個別に指定して実行してください。
 - **Baseline カバレッジ計測 (`BASH_XTRACEFD`) と `set -x` 出力検証の競合**: Baseline 行カバレッジは `BASH_XTRACEFD` と `PS4` を用いて計測を行います。テスト対象スクリプトや `.bats` テスト自身が `set -x` の標準エラー出力内容を直接アサートしている場合や `BASH_XTRACEFD` を操作している場合、カバレッジ計測が干渉するため自動的にカバレッジなし実行（Uninstrumented Baseline）へフォールバックします（明示的に `--no-coverage` を指定することも可能です）。
 - **`--git-diff` における行削除のみの Hunk**: `--git-diff <ref>` は Unified Diff の追加・変更行（`+` 側）のみを変異対象とします。行の削除のみが行われた Hunk からは新ファイル側の行番号が生成されないため、削除周辺の既存行は変異対象に含まれません。
 - **動的コード評価（動的関数ディスパッチ）の静的解析限界**: 関数単位のキャッシュ無効化およびテストフィルタリングは、AST 上の直接呼び出しおよび `trap` / `eval` 内のリテラル関数名トークンを静的解析します。実行時に文字列結合等で動的に組み立てられる関数呼び出し（例: `eval "${prefix}_${action}"` や変数経由の間接コールバック）は静的に追跡できないため、厳密な判定が求められる CI ゲートでは常に `--no-cache` の併用を推奨します。

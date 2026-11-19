@@ -19,7 +19,7 @@
 - **High-Performance Parallel Execution (`--jobs`) & Isolated Worker Sandboxes**
   - Spawns isolated per-worker temporary workspaces via single-pass in-memory manifest caching (preserving symlinks and protecting host files from in-place test modifications) and features intelligent test routing that executes only relevant `@test` blocks using `bats --filter`.
 - **Baseline Line Coverage (`BASH_XTRACEFD` + `PS4`) & Incremental Caching (`XDG_CACHE_HOME`)**
-  - Gathers per-line test execution mapping during a single baseline run using dynamic file descriptor allocation (`{__bashtion_cov_fd}`). Mutants on uncovered lines are instantly marked as `SURVIVED [UNCOVERED]` (0ms test skip). Subsequent runs are accelerated using deterministic SHA-256 function-level caching.
+  - Gathers per-line test execution mapping during a single baseline run using dynamic file descriptor allocation (`{__bashtion_cov_fd}`). Mutants on uncovered lines are instantly marked as `UNCOVERED` (0ms test skip, reported distinctly from covered `SURVIVED` mutants alongside both overall and covered-only mutation scores). Subsequent runs are accelerated using deterministic SHA-256 function-level caching.
 - **Multi-File / Directory Globbing & Automatic Test Mapping**
   - Specify directories or globs (e.g. `--target "src/**/*.sh"`). Automatically pairs target scripts with corresponding `.bats` test suites via explicit config, static analysis of `source`/`load` directives, or naming conventions.
 - **Process Group Timeout Management**
@@ -182,18 +182,21 @@ Mutation Score: 86.4%
 | Option | Default | Description |
 | :--- | :--- | :--- |
 | `--target <path/glob>`, `-t` | (Required) | Target Bash script (`.sh`), directory, or glob pattern (e.g. `src/**/*.sh`) |
-| `--test <path>` | (Auto-discovered) | Path to `bats-core` test file or directory. Can be omitted if test files match conventions or `source`/`load` refs. If multiple targets have no individual match and `--test` names a single `.bats` file, all targets fall back to that shared file |
+| `--test <path>` | (Auto-discovered) | Path to `bats-core` test file(s), directory, or glob. Repeatable (`--test a.bats --test b.bats`) or comma-separated (`--test a.bats,b.bats`). Auto-discovers all matching `.bats` files via conventions and `source`/`load` directives if omitted |
 | `--config <path>` | `.bashtion.toml` | Path to configuration file (automatically loaded from `.bashtion.toml` in workdir or `${XDG_CONFIG_HOME:-~/.config}/bashtion/config.toml`) |
 | `--bats <bin>` | `"bats"` | Executable name or path for `bats` |
 | `--bats-args <args>` | `""` | Additional pass-through arguments to `bats` (e.g. `--bats-args "--filter smoke"`; specifying `--filter`/`-f` disables Bashtion's auto-filter) |
 | `--jobs <N>`, `-j` | CPU Cores | Number of parallel worker jobs |
 | `--timeout <dur>` | `max(5s, 5x baseline)` | Execution timeout per mutant (e.g. `3s`) |
 | `--format <fmt>` | `"text"` | Output report format: `text`, `llm`, `json`, `markdown` |
+| `--json-out <path>` | `""` | Write JSON report to `<path>` in addition to the primary `--format` stdout report (e.g. stream `text` while saving JSON) |
+| `--progress <mode>` | `"auto"` | Progress output to `stderr`: `auto`, `always`, `never` (`auto` emits progress for `text`/`json`/`markdown` and suppresses non-TTY `llm`) |
+| `--quiet`, `-q` | `false` | Suppress progress output on `stderr` (alias for `--progress never`) |
 | `--min-score <float>` | `0` (Disabled) | Required minimum mutation score (0-100). Exits with code 1 if not met (0 mutants inside `--git-diff` scope is allowed and passes) |
 | `--git-diff <ref>` | `""` (All lines) | Only mutate lines changed in git diff against `<ref>` (e.g. `HEAD`, `origin/main`). Passing runs with 0 diff-scoped mutants satisfy `--min-score` |
-| `--no-cache` | `false` | Disable incremental caching. Recommended for authoritative CI `--min-score` gates |
+| `--no-cache` | `false` | Disable incremental caching completely (overrides `--cache-file`; recommended for authoritative CI `--min-score` gates and read-only sandboxes) |
 | `--no-coverage` | `false` | Disable baseline line coverage instrumentation |
-| `--cache-file <path>` | `${XDG_CACHE_HOME:-~/.cache}/bashtion/<hash>.json` | Override path to incremental cache file |
+| `--cache-file <path>` | `${XDG_CACHE_HOME:-~/.cache}/bashtion/<hash>.json` | Override path to incremental cache file (caching is enabled by default unless `--no-cache` is set; falls back to `./.bashtion-cache.json`) |
 | `--workspace <dir>` | (Auto) | Explicit workspace root directory copied into mutant sandboxes |
 | `--workspace-include` | `""` | Comma-separated workspace paths/patterns to include despite default skips (e.g. `.git,node_modules/bats-support`) |
 | `--workspace-exclude` | `""` | Comma-separated workspace paths/patterns to exclude from mutant sandboxes |
@@ -207,18 +210,27 @@ Mutation Score: 86.4%
 ```toml
 target = "examples/deploy_helper.sh"
 test = "examples/deploy_helper.bats"
-# For multi-target globbing or explicit mappings:
+# For multiple test suites, multi-target globbing, or explicit mappings:
 # targets = ["src/**/*.sh"]
+# tests = ["test/unit.bats", "test/integration.bats"]
 # [mappings]
-# "src/custom.sh" = "test/custom_suite.bats"
+# "src/custom.sh" = ["test/custom_unit.bats", "test/custom_edge.bats"]
 bats = "bats"
 jobs = 4
 timeout = "5s"
 format = "text"
+# json_out = "reports/bashtion.json"
+# progress = "auto" # auto | always | never
 min_score = 80.0
 no_cache = false
 disabled_categories = ["BOOL_CMD"]
 ```
+
+> [!NOTE]
+> **v0.2.0 Report & JSON Schema Changes**:
+> - Uncovered mutants now have dedicated status `"UNCOVERED"` (disjoint from covered `"SURVIVED"` mutants) and are listed under `uncovered_mutants` separately from `survived_mutants`, so `killed + timeout + survived + uncovered + errors == total_mutants`.
+> - Each JSON mutant now includes a deterministic 16-hex `key` (independent of sequential `id`) and an explicit `covered` (`true` | `false` | `null`) field.
+> - Top-level JSON adds `covered_mutants`, `covered_mutation_score` (alongside overall `mutation_score`), `coverage_enabled`, `cache_enabled`, `cache_file`, and `test_files`.
 
 ### Excluding Mutations with Pragmas
 
@@ -266,7 +278,6 @@ return 0
 
 ### Known Limitations & Future Considerations
 
-- **1-to-1 Target-to-Suite Pairing per Run**: Automatic test discovery and `--test <dir>` pair each target script with a single primary `.bats` file. If tests for a single script are split across multiple `.bats` files, invoke `bashtion` per test file explicitly.
 - **Baseline Coverage (`BASH_XTRACEFD`) vs. `set -x` Output Assertions**: Baseline line coverage instruments the target script using `BASH_XTRACEFD` and `PS4`. If a target script or test explicitly asserts `set -x` trace output on `stderr` or manipulates `BASH_XTRACEFD`, baseline instrumentation will interfere and automatically fall back to an uninstrumented baseline run (or you can pass `--no-coverage`).
 - **Deletion-Only Hunks in `--git-diff`**: `--git-diff <ref>` scopes mutations strictly to added or modified lines (`+` side of the unified diff). Commits or hunks that only delete lines produce no target line numbers in the new revision and therefore generate 0 diff-scoped mutants.
 - **Dynamic Dispatch & Static Call Graph Analysis**: Function-level cache invalidation and test filtering analyze direct AST calls as well as literal function tokens in `trap` and `eval`. Highly dynamic dispatch (e.g., constructing function names at runtime via `eval "${prefix}_${action}"` or indirect variable callbacks) cannot be statically traced; always pass `--no-cache` in authoritative CI gates.

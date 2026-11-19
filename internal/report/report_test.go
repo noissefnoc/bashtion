@@ -134,24 +134,93 @@ func TestWrite_TextFormatAndParseFormat(t *testing.T) {
 
 func TestWrite_UncoveredAndCacheHits(t *testing.T) {
 	sum, src := sampleSummaryAndSrc(t)
-	sum.Uncovered = 1
-	sum.CacheHits = 2
+	sum.CoverageEnabled = true
+	sum.CacheEnabled = true
+	sum.CacheFile = "/tmp/bashtion-cache.json"
+	sum.TestFiles = []string{"deploy_a.bats", "deploy_b.bats"}
+	sum.TestFile = "deploy_a.bats, deploy_b.bats"
+	// Make result[0] UNCOVERED (separate from SURVIVED), and result[1] SURVIVED (covered)
+	sum.Results[0].Status = runner.StatusUncovered
 	sum.Results[0].Uncovered = true
+	covFalse := false
+	covTrue := true
+	sum.Results[0].Covered = &covFalse
+	sum.Results[1].Status = runner.StatusSurvived
+	sum.Results[1].Covered = &covTrue
+	for i := 2; i < len(sum.Results); i++ {
+		sum.Results[i].Covered = &covTrue
+	}
+	sum.Uncovered = 1
+	sum.Survived = 1
+	sum.Killed = len(sum.Results) - 2
+	sum.CacheHits = 2
 
 	var textBuf bytes.Buffer
 	if err := report.Write(&textBuf, report.FormatText, sum, src, 0); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(textBuf.String(), "[UNCOVERED]") || !strings.Contains(textBuf.String(), "Cache Hits    : 2") {
-		t.Errorf("expected [UNCOVERED] and Cache Hits in text report:\n%s", textBuf.String())
+	textOut := textBuf.String()
+	for _, want := range []string{
+		"Survived      : 1",
+		"Uncovered     : 1",
+		"Cache Hits    : 2",
+		"(covered only:",
+		"Survived Mutants (1)",
+		"Uncovered Mutants (1)",
+		"[UNCOVERED]",
+	} {
+		if !strings.Contains(textOut, want) {
+			t.Errorf("expected %q in text report:\n%s", want, textOut)
+		}
 	}
 
 	var llmBuf bytes.Buffer
 	if err := report.Write(&llmBuf, report.FormatLLM, sum, src, 0); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(llmBuf.String(), "status: `UNCOVERED`") || !strings.Contains(llmBuf.String(), "never executed during the baseline") {
-		t.Errorf("expected uncovered status and hint in LLM report:\n%s", llmBuf.String())
+	llmOut := llmBuf.String()
+	for _, want := range []string{
+		"status: `UNCOVERED`",
+		"never executed during the baseline",
+		"Action Required: 1 Survived Mutant(s)",
+		"Action Required: 1 Uncovered Mutant(s)",
+		"covered score:",
+		"--test deploy_a.bats --test deploy_b.bats",
+	} {
+		if !strings.Contains(llmOut, want) {
+			t.Errorf("expected %q in LLM report:\n%s", want, llmOut)
+		}
+	}
+
+	var jsonBuf bytes.Buffer
+	if err := report.Write(&jsonBuf, report.FormatJSON, sum, src, 0); err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(jsonBuf.Bytes(), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, jsonBuf.String())
+	}
+	if parsed["coverage_enabled"] != true || parsed["cache_enabled"] != true || parsed["cache_file"] != "/tmp/bashtion-cache.json" {
+		t.Errorf("unexpected coverage/cache metadata in JSON: %+v", parsed)
+	}
+	if parsed["survived"] != float64(1) || parsed["uncovered"] != float64(1) {
+		t.Errorf("expected disjoint survived=1 and uncovered=1, got survived=%v uncovered=%v", parsed["survived"], parsed["uncovered"])
+	}
+	if parsed["covered_mutation_score"] == nil {
+		t.Errorf("expected non-null covered_mutation_score in JSON")
+	}
+	survivedArr, _ := parsed["survived_mutants"].([]any)
+	uncoveredArr, _ := parsed["uncovered_mutants"].([]any)
+	if len(survivedArr) != 1 || len(uncoveredArr) != 1 {
+		t.Fatalf("expected 1 survived and 1 uncovered mutant array entries, got survived=%d uncovered=%d", len(survivedArr), len(uncoveredArr))
+	}
+	u0 := uncoveredArr[0].(map[string]any)
+	if u0["status"] != "UNCOVERED" || u0["covered"] != false || len(u0["key"].(string)) != 16 {
+		t.Errorf("unexpected uncovered jsonMutant: %+v", u0)
+	}
+	s0 := survivedArr[0].(map[string]any)
+	if s0["status"] != "SURVIVED" || s0["covered"] != true || len(s0["key"].(string)) != 16 {
+		t.Errorf("unexpected survived jsonMutant: %+v", s0)
 	}
 }
 

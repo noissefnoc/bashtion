@@ -230,7 +230,7 @@ cache_file = ".custom-cache.json"
 	if len(cfg.Targets) != 2 || cfg.Targets[0] != "src/a.sh" || cfg.Targets[1] != "src/#special.sh" {
 		t.Errorf("unexpected Targets: %+v", cfg.Targets)
 	}
-	if cfg.Mappings["src/a:1.sh"] != "test/custom_a.bats" {
+	if !reflect.DeepEqual(cfg.Mappings["src/a:1.sh"], []string{"test/custom_a.bats"}) {
 		t.Errorf("unexpected Mappings: %+v", cfg.Mappings)
 	}
 	if !cfg.NoCache || !cfg.NoCoverage || cfg.CacheFile != ".custom-cache.json" {
@@ -442,5 +442,72 @@ func TestParseOptions_NonLocalCacheFileWarningAndGuideHelp(t *testing.T) {
 		Stderr: &bytes.Buffer{},
 	}); err == nil {
 		t.Errorf("expected error for unexpected positional argument after guide")
+	}
+}
+
+func TestParseOptions_MultiTestProgressJSONOutAndCacheConflictWarning(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	opts, err := ParseOptions([]string{
+		"--target", "src/app.sh",
+		"--test", "test/a.bats",
+		"--test", "test/b.bats",
+		"--format", "text",
+		"--json-out", "reports/mutation.json",
+		"--progress", "always",
+		"--no-cache",
+		"--cache-file", "/tmp/c.json",
+	}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: &bytes.Buffer{},
+		Stderr: stderr,
+	})
+	if err != nil {
+		t.Fatalf("ParseOptions failed: %v", err)
+	}
+	if !reflect.DeepEqual(opts.TestPatterns(), []string{"test/a.bats", "test/b.bats"}) {
+		t.Errorf("unexpected TestPatterns: %+v", opts.TestPatterns())
+	}
+	if opts.JSONOut != "reports/mutation.json" || opts.Progress != ProgressAlways || !opts.NoCache {
+		t.Errorf("unexpected parsed flags: %+v", opts)
+	}
+	if !strings.Contains(stderr.String(), "both --no-cache and --cache-file were specified") {
+		t.Errorf("expected warning when both --no-cache and --cache-file are passed, got:\n%s", stderr.String())
+	}
+
+	// Conflicting --quiet and --progress always must return error
+	if _, err := ParseOptions([]string{"--target", "a.sh", "--quiet", "--progress", "always"}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: &bytes.Buffer{},
+		Stderr: &bytes.Buffer{},
+	}); err == nil {
+		t.Error("expected error combining --quiet with --progress always")
+	}
+
+	// Invalid --progress value must return error
+	if _, err := ParseOptions([]string{"--target", "a.sh", "--progress", "bogus"}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: &bytes.Buffer{},
+		Stderr: &bytes.Buffer{},
+	}); err == nil {
+		t.Error("expected error for invalid --progress value")
+	}
+
+	// TOML config with list mappings, tests, progress, and json_out
+	cfg, err := ParseFileConfig(`
+target = "src/app.sh"
+tests = ["test/a.bats", "test/b.bats"]
+json_out = "out/report.json"
+progress = "never"
+
+[mappings]
+"src/app.sh" = ["test/a.bats", "test/b.bats"]
+`)
+	if err != nil {
+		t.Fatalf("ParseFileConfig multi-test failed: %v", err)
+	}
+	if !reflect.DeepEqual(cfg.Tests, []string{"test/a.bats", "test/b.bats"}) ||
+		!reflect.DeepEqual(cfg.Mappings["src/app.sh"], []string{"test/a.bats", "test/b.bats"}) ||
+		cfg.JSONOut != "out/report.json" || cfg.Progress != ProgressNever {
+		t.Errorf("unexpected parsed config: %+v", cfg)
 	}
 }

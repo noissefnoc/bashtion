@@ -2,7 +2,10 @@ package mutator
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -82,6 +85,25 @@ type Mutant struct {
 	// OriginalSrc references the shared, read-only target script buffer so each mutant does not
 	// duplicate the full source in memory. Use Apply or ApplyToBuffer to materialize the mutated file.
 	OriginalSrc []byte
+}
+
+// Key returns a deterministic, run-independent identifier (16-hex-char SHA-256 prefix)
+// derived from the mutant's normalized file path, line, column, category, original/replacement
+// text, and description. Unlike sequential ID, Key remains stable across runs with different
+// target sets, --git-diff filters, or --disable-category options.
+func (m Mutant) Key() string {
+	h := sha256.New()
+	cleanPath := filepath.ToSlash(filepath.Clean(m.FilePath))
+	_, _ = fmt.Fprintf(h, "file=%d:%s\nline=%d\ncol=%d\ncat=%d:%s\norig=%d:%s\nrep=%d:%s\ndesc=%d:%s\n",
+		len(cleanPath), cleanPath,
+		m.Line, m.Col,
+		len(m.Category), m.Category,
+		len(m.Original), m.Original,
+		len(m.Replacement), m.Replacement,
+		len(m.Description), m.Description,
+	)
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:8])
 }
 
 // UncoveredHint returns an actionable suggestion when the mutated line was never executed during baseline coverage.

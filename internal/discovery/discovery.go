@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -11,10 +12,10 @@ import (
 	"strings"
 )
 
-// TargetPair represents a resolved Bash target script and its corresponding bats test suite.
+// TargetPair represents a resolved Bash target script and its corresponding bats test file(s).
 type TargetPair struct {
 	TargetFile string
-	TestFile   string
+	TestFiles  []string
 }
 
 // ResolveTargets expands one or more file paths, directory paths, or glob patterns (including **)
@@ -103,12 +104,12 @@ func ResolveTargets(workDir string, rawPatterns []string) ([]string, error) {
 	return result, nil
 }
 
-// ResolvePairs resolves target patterns and pairs each target script with its .bats test file using:
-//  1. Explicit 1-to-1 --test flag (when single target and --test is a concrete file)
-//  2. Explicit mappings from .bashtion.yaml (`mappings:`)
-//  3. Static analysis of `source` / `.` / `load` directives inside .bats files
-//  4. Filename convention fallback (<dir>/<stem>.bats, test/<rel_dir>/<stem>.bats, test/<stem>.bats, etc.)
-func ResolvePairs(workDir string, targetPatterns []string, testPattern string, explicitMappings map[string]string, listOnly bool) ([]TargetPair, error) {
+// ResolvePairs resolves target patterns and pairs each target script with one or more .bats test files using:
+//  1. Explicit concrete --test file(s) or glob (when single target)
+//  2. Explicit mappings from .bashtion.toml (`[mappings]`)
+//  3. Naming convention candidates (<dir>/<stem>.bats, test/<rel_dir>/<stem>.bats, test/<stem>.bats, etc.)
+//  4. Static analysis of `source` / `.` / `load` directives inside .bats files
+func ResolvePairs(workDir string, targetPatterns []string, testPatterns []string, explicitMappings map[string][]string, listOnly bool) ([]TargetPair, error) {
 	if workDir == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -130,90 +131,114 @@ func ResolvePairs(workDir string, targetPatterns []string, testPattern string, e
 		return pairs, nil
 	}
 
-	// Fast path: single target + explicit single test file (not a directory or glob)
-	if len(targets) == 1 && testPattern != "" && !hasGlobMeta(testPattern) {
-		absTest := absOrJoin(workDir, testPattern)
-		if info, err := os.Stat(absTest); err != nil || !info.IsDir() {
-			return []TargetPair{{TargetFile: targets[0], TestFile: testPattern}}, nil
-		}
+	expandedTestPatterns := expandRawPatterns(workDir, testPatterns)
+
+	// Fast path: single target + explicit concrete test file(s) (no glob or directory)
+	if len(targets) == 1 && len(expandedTestPatterns) > 0 && areAllConcreteFiles(workDir, expandedTestPatterns) {
+		return []TargetPair{{
+			TargetFile: targets[0],
+			TestFiles:  dedupePaths(expandedTestPatterns),
+		}}, nil
 	}
 
-	// Collect candidate .bats files in the workspace (or within testPattern if specified)
-	candidateBats, err := collectCandidateBats(workDir, testPattern)
+	// Collect candidate .bats files in the workspace (or within testPatterns if specified)
+	candidateBats, allExplicitConcrete, hasDirPattern, err := collectCandidateBats(workDir, expandedTestPatterns)
 	if err != nil {
 		return nil, err
 	}
 
+	// Single target with explicit glob pattern(s) (e.g. --test "test/foo_*.bats"): run all matched .bats files
+	if len(targets) == 1 && len(expandedTestPatterns) > 0 && !hasDirPattern && len(candidateBats) > 0 {
+		return []TargetPair{{
+			TargetFile: targets[0],
+			TestFiles:  candidateBats,
+		}}, nil
+	}
+
 	// Pre-index which target scripts each .bats file sources or loads
 	batsSourceRefs := indexBatsSourceRefs(workDir, candidateBats)
-	restrictToCandidates := testPattern != ""
-	explicitSingleTest := ""
-	if restrictToCandidates && !hasGlobMeta(testPattern) && len(candidateBats) == 1 {
-		if info, statErr := os.Stat(absOrJoin(workDir, testPattern)); statErr == nil && !info.IsDir() {
-			explicitSingleTest = candidateBats[0]
-		}
-	}
+	restrictToCandidates := len(expandedTestPatterns) > 0
 
 	pairs := make([]TargetPair, 0, len(targets))
 	for _, target := range targets {
-		matchedTest := resolveTestForTarget(workDir, target, candidateBats, explicitMappings, batsSourceRefs, restrictToCandidates)
-		if matchedTest == "" && explicitSingleTest != "" {
-			matchedTest = explicitSingleTest
+		matchedTests := resolveTestsForTarget(workDir, target, candidateBats, explicitMappings, batsSourceRefs, restrictToCandidates)
+		if len(matchedTests) == 0 && allExplicitConcrete && len(candidateBats) > 0 {
+			matchedTests = append([]string(nil), candidateBats...)
 		}
-		if matchedTest == "" {
-			if len(targets) == 1 && testPattern == "" {
-				return nil, fmt.Errorf("--test <test.bats> is required unless --list is set (could not auto-discover a .bats file for %s)", target)
-			}
-			return nil, fmt.Errorf("could not find matching .bats test file for target %q", target)
+		if len(matchedTests) == 0 {
+			return nil, formatDiscoveryFailureError(workDir, target, expandedTestPatterns, candidateBats)
 		}
 		pairs = append(pairs, TargetPair{
 			TargetFile: target,
-			TestFile:   matchedTest,
+			TestFiles:  matchedTests,
 		})
 	}
 
 	return pairs, nil
 }
 
-func resolveTestForTarget(
-	workDir, target string,
-	candidateBats []string,
-	explicitMappings map[string]string,
-	batsSourceRefs map[string][]string,
-	restrictToCandidates bool,
-) string {
-	cleanTarget := filepath.ToSlash(filepath.Clean(relOrClean(workDir, target)))
-	targetBase := filepath.Base(cleanTarget)
-	ext := filepath.Ext(targetBase)
+func expandRawPatterns(workDir string, rawPatterns []string) []string {
+	var patterns []string
+	for _, raw := range rawPatterns {
+		if raw != "" {
+			if _, err := os.Stat(absOrJoin(workDir, raw)); err == nil {
+				patterns = append(patterns, raw)
+				continue
+			}
+		}
+		for _, part := range splitCommaOutsideBraces(raw) {
+			if p := strings.TrimSpace(part); p != "" {
+				patterns = append(patterns, p)
+			}
+		}
+	}
+	return patterns
+}
+
+func areAllConcreteFiles(workDir string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	for _, p := range patterns {
+		if hasGlobMeta(p) {
+			return false
+		}
+		if info, err := os.Stat(absOrJoin(workDir, p)); err == nil && info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+func dedupePaths(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		clean := filepath.Clean(p)
+		if !seen[clean] {
+			seen[clean] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func conventionCandidates(cleanTarget string) []string {
+	targetBase := path.Base(cleanTarget)
+	ext := path.Ext(targetBase)
 	stem := strings.TrimSuffix(targetBase, ext)
 	targetDir := path.Dir(cleanTarget)
 
-	// 1. Check explicit mappings from config (sorted for deterministic iteration)
-	keys := make([]string, 0, len(explicitMappings))
-	for k := range explicitMappings {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		v := explicitMappings[k]
-		cleanKey := filepath.ToSlash(filepath.Clean(relOrClean(workDir, k)))
-		if cleanKey == cleanTarget || k == target {
-			return v
-		}
-	}
-
-	// 2. Check convention candidates in priority order
-	var convCandidates []string
+	var raw []string
 	if targetDir == "." {
-		convCandidates = []string{
+		raw = []string{
 			stem + ".bats",
 			path.Join("test", stem+".bats"),
 			path.Join("tests", stem+".bats"),
 		}
 	} else {
-		// Also strip leading src/ or lib/ or scripts/ when mapping to test/ or tests/
 		trimmedSubdir := trimSourceRootPrefix(targetDir)
-		convCandidates = []string{
+		raw = []string{
 			path.Join(targetDir, stem+".bats"),
 			path.Join("test", targetDir, stem+".bats"),
 			path.Join("tests", targetDir, stem+".bats"),
@@ -224,6 +249,83 @@ func resolveTestForTarget(
 		}
 	}
 
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, c := range raw {
+		clean := path.Clean(c)
+		if !seen[clean] {
+			seen[clean] = true
+			out = append(out, clean)
+		}
+	}
+	return out
+}
+
+func formatDiscoveryFailureError(workDir, target string, testPatterns, candidateBats []string) error {
+	cleanTarget := filepath.ToSlash(filepath.Clean(relOrClean(workDir, target)))
+	convs := conventionCandidates(cleanTarget)
+
+	var b strings.Builder
+	if len(testPatterns) > 0 {
+		fmt.Fprintf(&b, "could not find matching .bats test file for %q within --test %s\n", target, strings.Join(testPatterns, ", "))
+	} else {
+		fmt.Fprintf(&b, "could not auto-discover a .bats test file for %q\n", target)
+	}
+	fmt.Fprintf(&b, "  checked naming conventions: %s\n", strings.Join(convs, ", "))
+	scope := "workspace"
+	if len(testPatterns) > 0 {
+		scope = strings.Join(testPatterns, ", ")
+	}
+	if len(candidateBats) == 0 {
+		fmt.Fprintf(&b, "  checked source/load directives: 0 .bats files found in %s\n", scope)
+	} else {
+		fmt.Fprintf(&b, "  checked source/load directives in %d .bats file(s) in %s (no matching reference found)\n", len(candidateBats), scope)
+	}
+	fmt.Fprint(&b, "  hint: pass --test <file.bats> (repeatable or comma-separated) or configure [mappings] in .bashtion.toml")
+	return errors.New(b.String())
+}
+
+func resolveTestsForTarget(
+	workDir, target string,
+	candidateBats []string,
+	explicitMappings map[string][]string,
+	batsSourceRefs map[string][]string,
+	restrictToCandidates bool,
+) []string {
+	cleanTarget := filepath.ToSlash(filepath.Clean(relOrClean(workDir, target)))
+	targetBase := filepath.Base(cleanTarget)
+	ext := filepath.Ext(targetBase)
+	stem := strings.TrimSuffix(targetBase, ext)
+
+	// 1. Check explicit mappings from config (sorted for deterministic iteration)
+	keys := make([]string, 0, len(explicitMappings))
+	for k := range explicitMappings {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		vals := explicitMappings[k]
+		if len(vals) == 0 {
+			continue
+		}
+		cleanKey := filepath.ToSlash(filepath.Clean(relOrClean(workDir, k)))
+		if cleanKey == cleanTarget || k == target {
+			return dedupePaths(vals)
+		}
+	}
+
+	var matched []string
+	seen := make(map[string]bool)
+	addMatch := func(p string) {
+		norm := filepath.ToSlash(filepath.Clean(relOrClean(workDir, p)))
+		if !seen[norm] {
+			seen[norm] = true
+			matched = append(matched, p)
+		}
+	}
+
+	// 2. Check convention candidates in priority order
+	convCandidates := conventionCandidates(cleanTarget)
 	candidateByRel := make(map[string]string, len(candidateBats))
 	for _, b := range candidateBats {
 		relB := filepath.ToSlash(filepath.Clean(relOrClean(workDir, b)))
@@ -231,8 +333,9 @@ func resolveTestForTarget(
 	}
 
 	for _, conv := range convCandidates {
-		if matched, ok := candidateByRel[filepath.ToSlash(path.Clean(conv))]; ok {
-			return matched
+		if m, ok := candidateByRel[conv]; ok {
+			addMatch(m)
+			continue
 		}
 		if restrictToCandidates {
 			continue
@@ -240,28 +343,38 @@ func resolveTestForTarget(
 		absConv := absOrJoin(workDir, filepath.FromSlash(conv))
 		if info, err := os.Stat(absConv); err == nil && !info.IsDir() {
 			if filepath.IsAbs(target) {
-				return absConv
+				addMatch(absConv)
+			} else {
+				addMatch(filepath.FromSlash(conv))
 			}
-			return filepath.FromSlash(conv)
 		}
 	}
 
 	// 3. Check static analysis of `source` / `.` / `load` in candidate .bats files.
-	// Pass 3a prefers full/path-qualified matches (e.g. src/common.sh != lib/common.sh).
+	// Pass 3a collects all full/path-qualified matches (e.g. src/common.sh != lib/common.sh).
 	for _, b := range candidateBats {
 		for _, ref := range batsSourceRefs[b] {
 			if refMatchesTargetExact(ref, cleanTarget) {
-				return b
+				addMatch(b)
+				break
 			}
 		}
 	}
+	if len(matched) > 0 {
+		return matched
+	}
+
 	// Pass 3b falls back to basename/stem matches only when the reference has no static directory prefix.
 	for _, b := range candidateBats {
 		for _, ref := range batsSourceRefs[b] {
 			if refMatchesTargetBase(ref, targetBase, stem) {
-				return b
+				addMatch(b)
+				break
 			}
 		}
+	}
+	if len(matched) > 0 {
+		return matched
 	}
 
 	// 4. When scoped to explicit --test candidates, match a unique <stem>.bats filename if unambiguous.
@@ -273,11 +386,11 @@ func resolveTestForTarget(
 			}
 		}
 		if len(stemMatches) == 1 {
-			return stemMatches[0]
+			return stemMatches
 		}
 	}
 
-	return ""
+	return nil
 }
 
 var sourceLoadRegex = regexp.MustCompile(`(?:^|[\s;(])(?:source|\.|load)\s+["']?([^"'\s;)]+)["']?`)
@@ -360,22 +473,58 @@ func refMatchesTargetBase(ref, targetBase, stem string) bool {
 	return refBase == targetBase || refBase == stem
 }
 
-func collectCandidateBats(workDir, testPattern string) ([]string, error) {
-	if testPattern != "" {
-		if hasGlobMeta(testPattern) {
-			return expandGlob(workDir, testPattern, isBatsFile)
+func collectCandidateBats(workDir string, testPatterns []string) (candidates []string, allExplicitConcrete bool, hasDirPattern bool, err error) {
+	if len(testPatterns) == 0 {
+		files, walkErr := walkScriptsInDir(workDir, workDir, ".", isBatsFile)
+		return files, false, false, walkErr
+	}
+
+	allExplicitConcrete = true
+	seen := make(map[string]bool)
+	addCandidate := func(p string) {
+		clean := filepath.Clean(p)
+		if !seen[clean] {
+			seen[clean] = true
+			candidates = append(candidates, p)
 		}
-		absTest := absOrJoin(workDir, testPattern)
-		info, err := os.Stat(absTest)
-		if err != nil {
-			return nil, fmt.Errorf("test path %q: %w", testPattern, err)
+	}
+
+	for _, pat := range testPatterns {
+		if hasGlobMeta(pat) {
+			allExplicitConcrete = false
+			matches, globErr := expandGlob(workDir, pat, isBatsFile)
+			if globErr != nil {
+				return nil, false, false, globErr
+			}
+			if len(matches) == 0 {
+				return nil, false, false, fmt.Errorf("no .bats test files matched pattern %q", pat)
+			}
+			for _, m := range matches {
+				addCandidate(m)
+			}
+			continue
+		}
+		absTest := absOrJoin(workDir, pat)
+		info, statErr := os.Stat(absTest)
+		if statErr != nil {
+			return nil, false, false, fmt.Errorf("test path %q: %w", pat, statErr)
 		}
 		if info.IsDir() {
-			return walkScriptsInDir(workDir, absTest, testPattern, isBatsFile)
+			allExplicitConcrete = false
+			hasDirPattern = true
+			dirMatches, walkErr := walkScriptsInDir(workDir, absTest, pat, isBatsFile)
+			if walkErr != nil {
+				return nil, false, false, walkErr
+			}
+			for _, m := range dirMatches {
+				addCandidate(m)
+			}
+			continue
 		}
-		return []string{testPattern}, nil
+		addCandidate(pat)
 	}
-	return walkScriptsInDir(workDir, workDir, ".", isBatsFile)
+
+	return candidates, allExplicitConcrete, hasDirPattern, nil
 }
 
 func trimSourceRootPrefix(dir string) string {

@@ -36,26 +36,33 @@ import (
 type Status string
 
 const (
-	StatusKilled   Status = "KILLED"
-	StatusSurvived Status = "SURVIVED"
-	StatusTimeout  Status = "TIMEOUT"
-	StatusError    Status = "ERROR"
+	StatusKilled    Status = "KILLED"
+	StatusSurvived  Status = "SURVIVED"
+	StatusUncovered Status = "UNCOVERED"
+	StatusTimeout   Status = "TIMEOUT"
+	StatusError     Status = "ERROR"
 )
 
 // Result holds the evaluation result for a single mutant.
 type Result struct {
 	Mutant    mutator.Mutant
 	Status    Status
+	Covered   *bool
 	Uncovered bool
 	Cached    bool
 	Duration  time.Duration
 	Output    string
 }
 
+func boolPtr(v bool) *bool {
+	return &v
+}
+
 // Summary aggregates all mutant results and phase timing breakdowns for a mutation testing run.
 type Summary struct {
 	TargetFile             string
 	TestFile               string
+	TestFiles              []string
 	BaselineDuration       time.Duration
 	WorkspaceSetupDuration time.Duration
 	MutantEvalDuration     time.Duration
@@ -68,12 +75,15 @@ type Summary struct {
 	CacheHits              int
 	Timeout                int
 	Errors                 int
+	CoverageEnabled        bool
+	CacheEnabled           bool
+	CacheFile              string
 	AllowZeroMutants       bool
 	Warnings               []string
 	Results                []Result
 }
 
-// Score returns the mutation score percentage (Killed + Timeout) / Total * 100.
+// Score returns the overall mutation score percentage (Killed + Timeout) / (Total - Errors) * 100.
 // If valid mutants is <= 0 (e.g. no mutants generated), it returns 0.0.
 func (s Summary) Score() float64 {
 	valid := s.Total - s.Errors
@@ -81,6 +91,25 @@ func (s Summary) Score() float64 {
 		return 0.0
 	}
 	return float64(s.Killed+s.Timeout) / float64(valid) * 100.0
+}
+
+// CoveredMutants returns the count of valid mutants that were executed during baseline coverage.
+func (s Summary) CoveredMutants() int {
+	covered := s.Total - s.Errors - s.Uncovered
+	if covered < 0 {
+		return 0
+	}
+	return covered
+}
+
+// CoveredScore returns the mutation score percentage computed strictly over covered mutants:
+// (Killed + Timeout) / CoveredMutants * 100. Returns (0.0, false) when CoveredMutants is 0.
+func (s Summary) CoveredScore() (float64, bool) {
+	covered := s.CoveredMutants()
+	if covered <= 0 {
+		return 0.0, false
+	}
+	return float64(s.Killed+s.Timeout) / float64(covered) * 100.0, true
 }
 
 // CommandExecutor abstracts external command execution (e.g. bats) for unit testability.
@@ -118,6 +147,7 @@ type Config struct {
 	Workspace         *WorkspaceSession
 	TargetFile        string
 	TestFile          string
+	TestFiles         []string
 	BatsBin           string
 	BatsArgs          []string
 	Jobs              int
@@ -130,6 +160,16 @@ type Config struct {
 	ToolVersion       string
 	Executor          CommandExecutor
 	OnProgress        func(completed, total int, res Result)
+}
+
+func (c Config) resolvedTestFiles() []string {
+	if len(c.TestFiles) > 0 {
+		return append([]string(nil), c.TestFiles...)
+	}
+	if c.TestFile != "" {
+		return []string{c.TestFile}
+	}
+	return nil
 }
 
 // WorkspaceSession holds a pre-scanned workspace manifest and reusable worker sandbox directories
@@ -308,11 +348,32 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 		absWorkspaceDir = absOrJoin(absWorkDir, cfg.WorkspaceDir)
 	}
 	absTarget := absOrJoin(absWorkDir, cfg.TargetFile)
-	absTest := absOrJoin(absWorkDir, cfg.TestFile)
+	testFiles := cfg.resolvedTestFiles()
+	if len(testFiles) == 0 {
+		return nil, errors.New("at least one bats test file is required")
+	}
+	testFileDisplay := strings.Join(testFiles, ", ")
 
-	batsBytes, _ := os.ReadFile(absTest)
+	absTests := make([]string, len(testFiles))
+	var combinedBatsBuf bytes.Buffer
 	targetBytes, _ := os.ReadFile(absTarget)
-	targetDisablesXtrace := coverage.DisablesXtrace(targetBytes) || coverage.DisablesXtrace(batsBytes)
+	targetDisablesXtrace := coverage.DisablesXtrace(targetBytes)
+	batsBytesByFile := make([][]byte, len(testFiles))
+	for i, tf := range testFiles {
+		absTests[i] = absOrJoin(absWorkDir, tf)
+		b, _ := os.ReadFile(absTests[i])
+		batsBytesByFile[i] = b
+		if len(b) > 0 {
+			if combinedBatsBuf.Len() > 0 {
+				combinedBatsBuf.WriteByte('\n')
+			}
+			combinedBatsBuf.Write(b)
+			if !targetDisablesXtrace && coverage.DisablesXtrace(b) {
+				targetDisablesXtrace = true
+			}
+		}
+	}
+	batsBytes := combinedBatsBuf.Bytes()
 
 	workerCount := cfg.Jobs
 	if len(mutants) == 0 {
@@ -325,7 +386,7 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 	var (
 		workRoot           string
 		relTarget          string
-		relTest            string
+		relTests           []string
 		manifest           *workspaceManifest
 		tmpRoot            string
 		workerDirs         []string
@@ -335,9 +396,9 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 	if cfg.Workspace != nil {
 		workRoot = cfg.Workspace.workRoot
 		var ok bool
-		relTarget, relTest, ok = checkFilesInsideRoot(workRoot, absTarget, absTest)
+		relTarget, relTests, ok = checkTargetAndTestsInsideRoot(workRoot, absTarget, absTests)
 		if !ok {
-			return nil, fmt.Errorf("target %q and test %q must reside within shared workspace root %q", absTarget, absTest, workRoot)
+			return nil, fmt.Errorf("target %q and test(s) %v must reside within shared workspace root %q", absTarget, absTests, workRoot)
 		}
 		manifest = cfg.Workspace.manifest
 		tmpRoot = cfg.Workspace.tmpRoot
@@ -352,13 +413,18 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 			workerInitialDirty[0] = false
 		}
 	} else {
-		workRoot, relTarget, relTest, err = resolveSafeWorkspaceRoot(ctx, absWorkDir, absWorkspaceDir, absTarget, absTest)
+		workRoot, relTarget, relTests, err = resolveSafeWorkspaceRootMultiTests(ctx, absWorkDir, absWorkspaceDir, absTarget, absTests)
 		if err != nil {
 			return nil, err
 		}
+		keepRelPaths := make(map[string]bool, len(relTests))
+		for _, rt := range relTests {
+			keepRelPaths[filepath.Clean(rt)] = true
+		}
 		manifest, err = buildWorkspaceManifest(workRoot, manifestOptions{
 			skipRelTarget: relTarget,
-			relTest:       relTest,
+			relTest:       relTests[0],
+			keepRelPaths:  keepRelPaths,
 			includes:      cfg.WorkspaceIncludes,
 			excludes:      cfg.WorkspaceExcludes,
 			maxFiles:      cfg.MaxWorkspaceFiles,
@@ -387,10 +453,15 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 	wsDuration := time.Since(wsStart)
 	warnings := append([]string(nil), manifest.warnings...)
 
+	safeTestArgs := make([]string, len(relTests))
+	for i, rt := range relTests {
+		safeTestArgs[i] = safeTestArg(rt)
+	}
+
 	// 1. Run single baseline test suite inside worker-0 sandbox (with optional BASH_XTRACEFD coverage)
 	var covProfile *coverage.Profile
 	baseStart := time.Now()
-	baselineArgs := append(append([]string{}, cfg.BatsArgs...), safeTestArg(relTest))
+	baselineArgs := append(append([]string{}, cfg.BatsArgs...), safeTestArgs...)
 	w0Target := filepath.Join(workerDirs[0], relTarget)
 	var baseOut []byte
 	var baseErr error
@@ -457,14 +528,20 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 		return nil, fmt.Errorf("baseline test suite failed before mutation testing (%v):\n%s", baseErr, string(baseOut))
 	}
 
+	coverageActive := covProfile != nil && !targetDisablesXtrace
+
 	if len(mutants) == 0 {
 		return &Summary{
 			TargetFile:             cfg.TargetFile,
-			TestFile:               cfg.TestFile,
+			TestFile:               testFileDisplay,
+			TestFiles:              testFiles,
 			BaselineDuration:       baseDuration,
 			WorkspaceSetupDuration: wsDuration,
 			Jobs:                   cfg.Jobs,
 			Total:                  0,
+			CoverageEnabled:        coverageActive,
+			CacheEnabled:           !cfg.NoCache,
+			CacheFile:              cfg.CacheFile,
 			Warnings:               warnings,
 			Results:                []Result{},
 			TotalDuration:          time.Since(runStart),
@@ -488,11 +565,15 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 
 	summary := &Summary{
 		TargetFile:             cfg.TargetFile,
-		TestFile:               cfg.TestFile,
+		TestFile:               testFileDisplay,
+		TestFiles:              testFiles,
 		BaselineDuration:       baseDuration,
 		WorkspaceSetupDuration: wsDuration,
 		Jobs:                   workerCount,
 		Total:                  len(mutants),
+		CoverageEnabled:        coverageActive,
+		CacheEnabled:           !cfg.NoCache,
+		CacheFile:              cfg.CacheFile,
 		Warnings:               warnings,
 		Results:                make([]Result, len(mutants)),
 	}
@@ -501,13 +582,18 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 	cacheStore := cfg.CacheStore
 	cachePath := cfg.CacheFile
 	if !cfg.NoCache && cacheStore == nil && cachePath != "" {
-		cacheStore, _ = cache.Load(cachePath)
+		var loadErr error
+		cacheStore, loadErr = cache.Load(cachePath)
+		if loadErr != nil {
+			summary.Warnings = append(summary.Warnings, fmt.Sprintf("failed to read cache file %q (%v); pass --cache-file <writable-path>, set XDG_CACHE_HOME, or pass --no-cache to disable caching", cachePath, loadErr))
+		}
 	}
 
 	// Compute cache keys per mutant if caching is active
 	var cacheKeys []string
 	if !cfg.NoCache && cacheStore != nil && len(targetBytes) > 0 {
-		cacheMeta := buildCacheMeta(ctx, cfg, manifest, relTarget, usingDefaultExecutor)
+		cacheMeta := buildCacheMeta(ctx, cfg, manifest, relTarget, coverageActive, usingDefaultExecutor)
+		cacheTestBytes := serializeTestFilesForCache(relTests, batsBytesByFile)
 		interdependentFuncs := findInterdependentFunctionsForMutants(targetBytes, mutants)
 		topLevelBytes := extractTopLevelNonFuncBytes(targetBytes)
 		cacheKeys = make([]string, len(mutants))
@@ -536,7 +622,7 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 				relTarget,
 				funcKeyName,
 				scopeSlice,
-				batsBytes,
+				cacheTestBytes,
 				string(m.Category),
 				m.Original,
 				m.Replacement,
@@ -560,11 +646,10 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 			summary.Killed++
 		case StatusError:
 			summary.Errors++
+		case StatusUncovered:
+			summary.Uncovered++
 		case StatusSurvived:
 			summary.Survived++
-			if res.Uncovered {
-				summary.Uncovered++
-			}
 		}
 		if res.Cached {
 			summary.CacheHits++
@@ -580,15 +665,16 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("mutation testing interrupted: %w", ctx.Err())
 		}
-		if covProfile != nil && !targetDisablesXtrace && !isMutantCovered(covProfile, m) {
+		if coverageActive && !isMutantCovered(covProfile, m) {
 			res := Result{
 				Mutant:    m,
-				Status:    StatusSurvived,
+				Status:    StatusUncovered,
+				Covered:   boolPtr(false),
 				Uncovered: true,
 				Duration:  0,
 			}
 			if len(cacheKeys) > i && cacheKeys[i] != "" {
-				cacheStore.Put(cacheKeys[i], cache.Entry{Status: string(StatusSurvived), Uncovered: true})
+				cacheStore.Put(cacheKeys[i], cache.Entry{Status: string(StatusUncovered), Uncovered: true})
 			}
 			recordResult(i, res)
 			continue
@@ -597,11 +683,19 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 		if len(cacheKeys) > i && cacheKeys[i] != "" {
 			if entry, ok := cacheStore.Get(cacheKeys[i]); ok {
 				st := Status(entry.Status)
-				if st == StatusKilled || st == StatusSurvived {
+				if st == StatusKilled || st == StatusSurvived || st == StatusUncovered {
+					if entry.Uncovered {
+						st = StatusUncovered
+					}
+					var cov *bool
+					if coverageActive {
+						cov = boolPtr(st != StatusUncovered)
+					}
 					res := Result{
 						Mutant:    m,
 						Status:    st,
-						Uncovered: entry.Uncovered,
+						Covered:   cov,
+						Uncovered: st == StatusUncovered,
 						Cached:    true,
 						Duration:  0,
 					}
@@ -619,7 +713,9 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 	if pendingJobs == 0 {
 		summary.MutantEvalDuration = time.Since(evalStart)
 		if !cfg.NoCache && cacheStore != nil && cachePath != "" {
-			_ = cacheStore.Save(cachePath)
+			if saveErr := cacheStore.Save(cachePath); saveErr != nil {
+				summary.Warnings = append(summary.Warnings, fmt.Sprintf("failed to write cache file %q (%v); pass --cache-file <writable-path>, set XDG_CACHE_HOME, or pass --no-cache to disable caching", cachePath, saveErr))
+			}
 		}
 		summary.TotalDuration = time.Since(runStart)
 		return summary, nil
@@ -719,7 +815,7 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 					if filterRegex != "" && !userFiltered {
 						args = append(args, "--filter", filterRegex)
 					}
-					args = append(args, safeTestArg(relTest))
+					args = append(args, safeTestArgs...)
 
 					var runErr error
 					out, runErr = cfg.Executor(runCtx, wDir, cfg.BatsBin, args...)
@@ -747,7 +843,7 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 						} else {
 							rerunCtx, rerunCancel := context.WithTimeout(ctx, timeout)
 							rerunStart := time.Now()
-							rerunArgs := append(append([]string{}, cfg.BatsArgs...), safeTestArg(relTest))
+							rerunArgs := append(append([]string{}, cfg.BatsArgs...), safeTestArgs...)
 							rerunOut, rerunErr := cfg.Executor(rerunCtx, wDir, cfg.BatsBin, rerunArgs...)
 							dur += time.Since(rerunStart)
 							rerunCtxErr := rerunCtx.Err()
@@ -770,9 +866,14 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 					cacheStore.Put(cacheKeys[idx], cache.Entry{Status: string(status)})
 				}
 
+				var cov *bool
+				if coverageActive {
+					cov = boolPtr(true)
+				}
 				res := Result{
 					Mutant:   m,
 					Status:   status,
+					Covered:  cov,
 					Duration: dur,
 					Output:   string(out),
 				}
@@ -798,7 +899,9 @@ func Run(ctx context.Context, cfg Config, mutants []mutator.Mutant) (*Summary, e
 	}
 
 	if !cfg.NoCache && cacheStore != nil && cachePath != "" {
-		_ = cacheStore.Save(cachePath)
+		if saveErr := cacheStore.Save(cachePath); saveErr != nil {
+			summary.Warnings = append(summary.Warnings, fmt.Sprintf("failed to write cache file %q (%v); pass --cache-file <writable-path>, set XDG_CACHE_HOME, or pass --no-cache to disable caching", cachePath, saveErr))
+		}
 	}
 
 	summary.TotalDuration = time.Since(runStart)
@@ -1902,33 +2005,49 @@ func checkFilesInsideRoot(root, absTarget, absTest string) (string, string, bool
 	return "", "", false
 }
 
-func resolveSafeWorkspaceRoot(ctx context.Context, absWorkDir, absWorkspaceDir, absTarget, absTest string) (string, string, string, error) {
+func checkTargetAndTestsInsideRoot(root, absTarget string, absTests []string) (string, []string, bool) {
+	relTarget, _, ok := checkFilesInsideRoot(root, absTarget, absTarget)
+	if !ok {
+		return "", nil, false
+	}
+	relTests := make([]string, len(absTests))
+	for i, absTest := range absTests {
+		_, relTest, testOK := checkFilesInsideRoot(root, absTarget, absTest)
+		if !testOK {
+			return "", nil, false
+		}
+		relTests[i] = relTest
+	}
+	return relTarget, relTests, true
+}
+
+func resolveSafeWorkspaceRootMultiTests(ctx context.Context, absWorkDir, absWorkspaceDir, absTarget string, absTests []string) (string, string, []string, error) {
 	if absWorkspaceDir != "" {
 		info, err := os.Stat(absWorkspaceDir)
 		if err != nil {
-			return "", "", "", fmt.Errorf("invalid --workspace %q: %w", absWorkspaceDir, err)
+			return "", "", nil, fmt.Errorf("invalid --workspace %q: %w", absWorkspaceDir, err)
 		}
 		if !info.IsDir() {
-			return "", "", "", fmt.Errorf("--workspace %q must be a directory", absWorkspaceDir)
+			return "", "", nil, fmt.Errorf("--workspace %q must be a directory", absWorkspaceDir)
 		}
 		if isFilesystemRoot(absWorkspaceDir) {
-			return "", "", "", fmt.Errorf("refusing filesystem root %q as workspace", absWorkspaceDir)
+			return "", "", nil, fmt.Errorf("refusing filesystem root %q as workspace", absWorkspaceDir)
 		}
-		if relT, relB, ok := checkFilesInsideRoot(absWorkspaceDir, absTarget, absTest); ok {
-			return absWorkspaceDir, relT, relB, nil
+		if relT, relBs, ok := checkTargetAndTestsInsideRoot(absWorkspaceDir, absTarget, absTests); ok {
+			return absWorkspaceDir, relT, relBs, nil
 		}
-		return "", "", "", fmt.Errorf("target %q and test %q must reside within --workspace %q", absTarget, absTest, absWorkspaceDir)
+		return "", "", nil, fmt.Errorf("target %q and test(s) %v must reside within --workspace %q", absTarget, absTests, absWorkspaceDir)
 	}
 
 	if isFilesystemRoot(absWorkDir) {
-		return "", "", "", fmt.Errorf("refusing filesystem root %q as implicit workspace root; pass --workspace", absWorkDir)
+		return "", "", nil, fmt.Errorf("refusing filesystem root %q as implicit workspace root; pass --workspace", absWorkDir)
 	}
 
-	if relT, relB, ok := checkFilesInsideRoot(absWorkDir, absTarget, absTest); ok {
+	if relT, relBs, ok := checkTargetAndTestsInsideRoot(absWorkDir, absTarget, absTests); ok {
 		if isHomeDir(absWorkDir) {
-			return "", "", "", fmt.Errorf("refusing home directory %q as implicit workspace root; run inside a project directory or pass --workspace", absWorkDir)
+			return "", "", nil, fmt.Errorf("refusing home directory %q as implicit workspace root; run inside a project directory or pass --workspace", absWorkDir)
 		}
-		return absWorkDir, relT, relB, nil
+		return absWorkDir, relT, relBs, nil
 	}
 
 	// Fallback only to the enclosing git repository toplevel (never arbitrary ancestors such as $HOME or /).
@@ -1937,12 +2056,12 @@ func resolveSafeWorkspaceRoot(ctx context.Context, absWorkDir, absWorkspaceDir, 
 		if gitTop == "" || isFilesystemRoot(gitTop) || isHomeDir(gitTop) {
 			continue
 		}
-		if relT, relB, ok := checkFilesInsideRoot(gitTop, absTarget, absTest); ok {
-			return gitTop, relT, relB, nil
+		if relT, relBs, ok := checkTargetAndTestsInsideRoot(gitTop, absTarget, absTests); ok {
+			return gitTop, relT, relBs, nil
 		}
 	}
 
-	return "", "", "", fmt.Errorf("target %q and test %q must reside within workspace %q (or a shared git repository; pass --workspace to specify root explicitly)", absTarget, absTest, absWorkDir)
+	return "", "", nil, fmt.Errorf("target %q and test(s) %v must reside within workspace %q (or a shared git repository; pass --workspace to specify root explicitly)", absTarget, absTests, absWorkDir)
 }
 
 func resolveSafeMultiWorkspaceRoot(ctx context.Context, absWorkDir, absWorkspaceDir string, absPaths []string) (string, error) {
@@ -2007,13 +2126,40 @@ func maxDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func buildCacheMeta(ctx context.Context, cfg Config, m *workspaceManifest, skipRelTarget string, probeVersions bool) []string {
+func serializeTestFilesForCache(relTests []string, contents [][]byte) []byte {
+	type entry struct {
+		path string
+		data []byte
+	}
+	entries := make([]entry, len(relTests))
+	for i, p := range relTests {
+		var d []byte
+		if i < len(contents) {
+			d = contents[i]
+		}
+		entries[i] = entry{path: filepath.ToSlash(filepath.Clean(p)), data: d}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].path < entries[j].path
+	})
+	var buf bytes.Buffer
+	_, _ = fmt.Fprintf(&buf, "tests=%d\n", len(entries))
+	for _, e := range entries {
+		_, _ = fmt.Fprintf(&buf, "file=%d:%s\nlen=%d\n", len(e.path), e.path, len(e.data))
+		buf.Write(e.data)
+		buf.WriteByte('\n')
+	}
+	return buf.Bytes()
+}
+
+func buildCacheMeta(ctx context.Context, cfg Config, m *workspaceManifest, skipRelTarget string, coverageActive, probeVersions bool) []string {
 	meta := []string{
 		"tool_version=" + cfg.ToolVersion,
 		"manifest=" + computeManifestHash(m, skipRelTarget),
 		"timeout=" + cfg.Timeout.String(),
 		"disable_filter=" + strconv.FormatBool(cfg.DisableTestFilter),
 		"disable_coverage=" + strconv.FormatBool(cfg.DisableCoverage),
+		"coverage_active=" + strconv.FormatBool(coverageActive),
 		"bats_bin=" + cfg.BatsBin,
 		"runtime=" + computeRuntimeSignature(ctx, cfg.Workspace, cfg.BatsBin, probeVersions),
 	}

@@ -522,3 +522,41 @@ check_ops() {
 			hasPOSIXEq, hasRemDoubleNot, hasRemRegexNot, hasRemPOSIXNot, hasFallthroughB, hasMultilineCallCov)
 	}
 }
+
+func TestMutantKey_DeterministicNormalizedAndUnique(t *testing.T) {
+	src := []byte("#!/usr/bin/env bash\nif [[ \"$1\" -ge 10 ]]; then\n  return 0\nfi\n")
+	m1, err := mutator.Generate("src/check.sh", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := mutator.Generate("./src/check.sh", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m1) < 3 || len(m1) != len(m2) {
+		t.Fatalf("unexpected mutant counts: %d vs %d", len(m1), len(m2))
+	}
+
+	seen := make(map[string]bool, len(m1))
+	for i := range m1 {
+		k1 := m1[i].Key()
+		k2 := m2[i].Key()
+		if len(k1) != 16 {
+			t.Errorf("expected 16-char hex key, got %q", k1)
+		}
+		if k1 != k2 {
+			t.Errorf("expected normalized path to yield identical key: %q vs %q", k1, k2)
+		}
+		if seen[k1] {
+			t.Errorf("duplicate key %q for mutant %+v", k1, m1[i])
+		}
+		seen[k1] = true
+	}
+
+	// Sequential ID differences must not change Key().
+	altered := m1[0]
+	altered.ID = 999
+	if altered.Key() != m1[0].Key() {
+		t.Errorf("Key() must be independent of sequential ID: %q vs %q", altered.Key(), m1[0].Key())
+	}
+}
