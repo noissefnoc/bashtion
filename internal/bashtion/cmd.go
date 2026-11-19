@@ -395,10 +395,19 @@ func MainCommandWithDeps(opts *Options, inout *cli.ProcInout, deps Deps) error {
 }
 
 func effectiveToolVersion() string {
-	if Version != "dev" {
-		return Version
+	info, _ := debug.ReadBuildInfo()
+	return resolveToolVersion(Version, info)
+}
+
+func resolveToolVersion(injected string, info *debug.BuildInfo) string {
+	v := normalizeVersion(injected)
+	if v != "" && v != "dev" {
+		return v
 	}
-	if info, ok := debug.ReadBuildInfo(); ok {
+	if info != nil {
+		if mainVer := normalizeVersion(info.Main.Version); mainVer != "" && mainVer != "(devel)" {
+			return mainVer
+		}
 		var rev, modified string
 		for _, s := range info.Settings {
 			switch s.Key {
@@ -408,9 +417,6 @@ func effectiveToolVersion() string {
 				modified = s.Value
 			}
 		}
-		if info.Main.Version != "" && info.Main.Version != "(devel)" {
-			return info.Main.Version
-		}
 		if rev != "" {
 			if modified == "true" {
 				return "dev-" + rev + "-dirty"
@@ -418,7 +424,21 @@ func effectiveToolVersion() string {
 			return "dev-" + rev
 		}
 	}
-	return Version
+	if v != "" {
+		return v
+	}
+	return "dev"
+}
+
+// normalizeVersion strips a leading "v"/"V" prefix from semver-like version strings
+// (e.g. "v0.2.0" -> "0.2.0") so GoReleaser binaries and `go install ...@vX.Y.Z` binaries
+// report the exact same version string and produce identical cache keys.
+func normalizeVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) >= 2 && (v[0] == 'v' || v[0] == 'V') && v[1] >= '0' && v[1] <= '9' {
+		return v[1:]
+	}
+	return v
 }
 
 func resolveCacheFilePath(workDir, explicitPath string, isRealRun bool) string {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -38,6 +39,21 @@ func TestMainCommandByArgs_Version(t *testing.T) {
 		t.Errorf("stdout = %q, want %q", stdout.String(), expected)
 	}
 
+	// Leading "v" prefix injected via ldflags must be normalized consistently.
+	Version = "v1.2.3"
+	stdout.Reset()
+	code = MainCommandByArgs([]string{"-v"}, &cli.ProcInout{
+		Stdin:  strings.NewReader(""),
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+	if code != 0 {
+		t.Fatalf("want exit code 0 for -v with v-prefixed version, got %d (stderr: %s)", code, stderr.String())
+	}
+	if stdout.String() != expected {
+		t.Errorf("stdout for v1.2.3 = %q, want %q", stdout.String(), expected)
+	}
+
 	// When Version is "dev", MainCommandByArgs should use effectiveToolVersion() (e.g. build info / VCS revision).
 	Version = "dev"
 	stdout.Reset()
@@ -52,6 +68,68 @@ func TestMainCommandByArgs_Version(t *testing.T) {
 	wantDev := "bashtion version " + effectiveToolVersion() + "\n"
 	if stdout.String() != wantDev {
 		t.Errorf("stdout for dev = %q, want %q", stdout.String(), wantDev)
+	}
+}
+
+func TestResolveToolVersion_NormalizesVPrefixConsistently(t *testing.T) {
+	cases := []struct {
+		name     string
+		injected string
+		info     *debug.BuildInfo
+		want     string
+	}{
+		{
+			name:     "goreleaser injected semver",
+			injected: "0.2.0",
+			want:     "0.2.0",
+		},
+		{
+			name:     "ldflags injected v-prefixed semver",
+			injected: "v0.2.0",
+			want:     "0.2.0",
+		},
+		{
+			name:     "go install build info v-prefixed release",
+			injected: "dev",
+			info:     &debug.BuildInfo{Main: debug.Module{Version: "v0.2.0"}},
+			want:     "0.2.0",
+		},
+		{
+			name:     "go install build info pseudo-version",
+			injected: "dev",
+			info:     &debug.BuildInfo{Main: debug.Module{Version: "v0.0.0-20261119105300-33ce032abcde"}},
+			want:     "0.0.0-20261119105300-33ce032abcde",
+		},
+		{
+			name:     "local devel build with vcs revision",
+			injected: "dev",
+			info: &debug.BuildInfo{
+				Main: debug.Module{Version: "(devel)"},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "abc1234"},
+					{Key: "vcs.modified", Value: "true"},
+				},
+			},
+			want: "dev-abc1234-dirty",
+		},
+		{
+			name:     "fallback dev without build info",
+			injected: "dev",
+			want:     "dev",
+		},
+		{
+			name:     "non-semver label starting with v is preserved",
+			injected: "vnext",
+			want:     "vnext",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveToolVersion(tc.injected, tc.info); got != tc.want {
+				t.Errorf("resolveToolVersion(%q, ...) = %q, want %q", tc.injected, got, tc.want)
+			}
+		})
 	}
 }
 
