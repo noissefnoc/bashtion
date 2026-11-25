@@ -33,8 +33,29 @@ sboms:
   - artifacts: archive
 
 changelog:
+  use: github
   sort: asc
   filters:
     exclude:
+      - "^Merge pull request"
+      - "^Merge branch"
       - "^docs:"
       - "^test:"
+  groups:
+    - title: "Breaking Changes"
+      regexp: '^.*!:'
+      order: 0
+    - title: "Dependencies"
+      regexp: '^(chore|fix)\(deps\):'
+      order: 3
+    - title: "Features"
+      regexp: '^feat(\([^)]+\))?:'
+      order: 1
+    - title: "Bug Fixes"
+      regexp: '^fix(\([^)]+\))?:'
+      order: 2
+    - title: "CI & Maintenance"
+      regexp: '^(ci|build|chore|refactor|perf)(\([^)]+\))?:'
+      order: 4
+    - title: "Other Changes"
+      order: 999
