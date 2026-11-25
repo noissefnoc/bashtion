@@ -1,5 +1,5 @@
 # Stage 1: Build static bashtion binary using Go 1.27
-FROM golang:1.27-alpine@sha256:eb61c3873c97416fff0116553fff65d67a3549f72e11d9758849a689cdd8b523 AS builder
+FROM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS builder
 
 ARG VERSION=dev
 WORKDIR /src
@@ -10,7 +10,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X github.com/noissefnoc/bashtion/internal/bashtion.Version=${VERSION}" -o /bin/bashtion ./cmd/bashtion
 
 # Stage 2: Clean Linux testing environment (Ubuntu 26.04 LTS)
-FROM ubuntu:26.04@sha256:065aa8626841f16057b78b027b464cd59c4fac36c204c72dcbf48d66f5fa8a96
+FROM ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
 
 ENV DEBIAN_FRONTEND=noninteractive
 
